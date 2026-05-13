@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MrPowerGamerBR <git@mrpowergamerbr.com>
+Date: Mon, 6 Nov 2023 21:54:33 -0300
+Subject: [PATCH] SparklyPaper: Track how much MSPT each world used
+
+
+diff --git a/src/main/java/io/papermc/paper/command/MSPTCommand.java b/src/main/java/io/papermc/paper/command/MSPTCommand.java
+index 8b5293b0c696ef21d0101493ffa41b60bf0bc86b..601198a33adb29316b0617d5390d1620b7c1095c 100644
+--- a/src/main/java/io/papermc/paper/command/MSPTCommand.java
++++ b/src/main/java/io/papermc/paper/command/MSPTCommand.java
+@@ -78,6 +78,46 @@ public final class MSPTCommand extends Command {
+                 )
+             )
+         );
++
++        // SparklyPaper start - track world's MSPT
++        sender.sendMessage(text());
++        sender.sendMessage(text().content("World tick times ").color(GOLD)
++            .append(text().color(YELLOW)
++                .append(
++                    text("("),
++                    text("avg", GRAY),
++                    text("/"),
++                    text("min", GRAY),
++                    text("/"),
++                    text("max", GRAY),
++                    text(")")
++                )
++            ).append(
++                text(" from last 5s"),
++                text(",", GRAY),
++                text(" 10s"),
++                text(",", GRAY),
++                text(" 1m"),
++                text(":", YELLOW)
++            )
++        );
++        for (net.minecraft.server.level.ServerLevel serverLevel : server.getAllLevels()) {
++            List<Component> worldTimes = new ArrayList<>();
++            worldTimes.addAll(eval(serverLevel.tickTimes5s.getTimes()));
++            worldTimes.addAll(eval(serverLevel.tickTimes10s.getTimes()));
++            worldTimes.addAll(eval(serverLevel.tickTimes60s.getTimes()));
++
++            sender.sendMessage(text().content("◴ " + serverLevel.getWorld().getName() + ": ").color(GOLD)
++                .append(text().color(GRAY)
++                    .append(
++                        worldTimes.get(0), SLASH, worldTimes.get(1), SLASH, worldTimes.get(2), text(", ", YELLOW),
++                        worldTimes.get(3), SLASH, worldTimes.get(4), SLASH, worldTimes.get(5), text(", ", YELLOW),
++                        worldTimes.get(6), SLASH, worldTimes.get(7), SLASH, worldTimes.get(8)
++                    )
++                )
++            );
++        }
++        // SparklyPaper end
+         return true;
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index b6ad776a0a1bc9f7bd25fa665633a75ac500544c..edd95b877637a4a709f7ad07e2676a50125ce62c 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -1778,7 +1778,16 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             // CraftBukkit end */
+ 
+             try {
++                long i = net.minecraft.Util.getNanos(); // SparklyPaper - track world's MSPT
+                 worldserver.tick(shouldKeepTicking);
++                // SparklyPaper start - track world's MSPT
++                long j = net.minecraft.Util.getNanos() - i;
++
++                // These are from the "tickServer" function
++                worldserver.tickTimes5s.add(this.tickCount, j);
++                worldserver.tickTimes10s.add(this.tickCount, j);
++                worldserver.tickTimes60s.add(this.tickCount, j);
++                // SparklyPaper end
+                 // Paper start
+                 for (final io.papermc.paper.chunk.SingleThreadChunkRegionManager regionManager : worldserver.getChunkSource().chunkMap.regionManagers) {
+                     regionManager.recalculateRegions();
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index dced0a22e924838b13edd0c24a7d3fb3de9242d6..9558212be222361760ec6d0013346f36fc84fba9 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -186,6 +186,12 @@ import su.plo.matter.Globals;
+ 
+ public class ServerLevel extends Level implements WorldGenLevel {
+ 
++    // SparklyPaper start - track world's MSPT
++    public final net.minecraft.server.MinecraftServer.TickTimes tickTimes5s = new net.minecraft.server.MinecraftServer.TickTimes(100);
++    public final net.minecraft.server.MinecraftServer.TickTimes tickTimes10s = new net.minecraft.server.MinecraftServer.TickTimes(200);
++    public final net.minecraft.server.MinecraftServer.TickTimes tickTimes60s = new net.minecraft.server.MinecraftServer.TickTimes(1200);
++    // SparklyPaper end
++
+     public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
+     public static final IntProvider RAIN_DELAY = UniformInt.of(12000, 180000);
+     public static final IntProvider RAIN_DURATION = UniformInt.of(12000, 24000);

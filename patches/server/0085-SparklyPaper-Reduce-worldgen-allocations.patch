@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: HaHaWTH <102713261+HaHaWTH@users.noreply.github.com>
 Date: Fri, 14 Jun 2024 23:19:55 +0800
-Subject: [PATCH] Reduce-worldgen-allocations
+Subject: [PATCH] SparklyPaper: Reduce-worldgen-allocations
 
 This change optimizes the way SurfaceRules update their biome supplier,avoiding unnecessary object creations and thus reducing memory allocations
 during world generation. The update method now reuses the existing PositionalBiomeGetter object if it's already present, otherwise it

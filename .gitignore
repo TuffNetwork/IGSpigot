@@ -23,3 +23,15 @@ Leaf-API
 Leaf-MojangAPI
 Leaf-Server
 paper-api-generator
+
+# Server runtime files
+cache/
+libraries/
+logs/
+server.properties
+versions/
+leaf_config/
+
+# References
+SparklyPaper-ver-1.20.6/
+
