@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Wed, 13 May 2026 10:59:28 -0400
+Subject: [PATCH] Optimize mob spawning
+
+
+diff --git a/src/main/java/net/minecraft/world/level/NaturalSpawner.java b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+index 31588bbfa4b80ed3ef19942bbe04baebd51e67fb..a6132f24f03b6991392a9dbae02ca3e755a8d15b 100644
+--- a/src/main/java/net/minecraft/world/level/NaturalSpawner.java
++++ b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+@@ -238,6 +238,7 @@ public final class NaturalSpawner {
+                 int j1 = Mth.ceil(world.random.nextFloat() * 4.0F);
+                 int k1 = 0;
+                 int l1 = 0;
++                Player entityhuman = null; // Leaf - optimize mob spawning - cache nearest player for cluster
+ 
+                 while (true) {
+                     if (l1 < j1) {
+@@ -248,14 +249,17 @@ public final class NaturalSpawner {
+                             blockposition_mutableblockposition.set(l, i, i1);
+                             double d0 = (double) l + 0.5D;
+                             double d1 = (double) i1 + 0.5D;
+-                            Player entityhuman = world.getNearestPlayer(d0, (double) i, d1, -1.0D, world.purpurConfig.mobSpawningIgnoreCreativePlayers); // Purpur
++                            if (entityhuman == null || entityhuman.distanceToSqr(d0, (double) i, d1) > 128.0D * 128.0D) { // Leaf - optimize mob spawning - cache nearest player for cluster
++                                entityhuman = world.getNearestPlayer(d0, (double) i, d1, 128.0D, world.purpurConfig.mobSpawningIgnoreCreativePlayers); // Purpur // Leaf - optimize mob spawning
++                            }
+ 
+                             if (entityhuman != null) {
+                                 double d2 = entityhuman.distanceToSqr(d0, (double) i, d1);
+ 
+                                 if (world.isLoadedAndInBounds(blockposition_mutableblockposition) && NaturalSpawner.isRightDistanceToPlayerAndSpawnPoint(world, chunk, blockposition_mutableblockposition, d2)) { // Paper - don't load chunks for mob spawn
+                                     if (biomesettingsmobs_c == null) {
+-                                        Optional<MobSpawnSettings.SpawnerData> optional = NaturalSpawner.getRandomSpawnMobAt(world, structuremanager, chunkgenerator, group, world.random, blockposition_mutableblockposition);
++                                        Holder<Biome> holder = world.getBiome(blockposition_mutableblockposition); // Leaf - optimize mob spawning - get biome once
++                                        Optional<MobSpawnSettings.SpawnerData> optional = NaturalSpawner.getRandomSpawnMobAt(world, structuremanager, chunkgenerator, group, world.random, blockposition_mutableblockposition, holder); // Leaf - optimize mob spawning
+ 
+                                         if (optional.isEmpty()) {
+                                             break label53;
+@@ -327,7 +331,14 @@ public final class NaturalSpawner {
+     }
+ 
+     private static boolean isRightDistanceToPlayerAndSpawnPoint(ServerLevel world, ChunkAccess chunk, BlockPos.MutableBlockPos pos, double squaredDistance) {
+-        return squaredDistance <= 576.0D ? false : (world.getSharedSpawnPos().closerToCenterThan(new Vec3((double) pos.getX() + 0.5D, (double) pos.getY(), (double) pos.getZ() + 0.5D), 24.0D) ? false : Objects.equals(new ChunkPos(pos), chunk.getPos()) || world.isNaturalSpawningAllowed((BlockPos) pos));
++        if (squaredDistance <= 576.0D) return false;
++        if (world.getSharedSpawnPos().closerToCenterThan(new Vec3((double) pos.getX() + 0.5D, (double) pos.getY(), (double) pos.getZ() + 0.5D), 24.0D)) return false;
++
++        // Leaf - optimize mob spawning - avoid ChunkPos allocation
++        ChunkPos chunkPos = chunk.getPos();
++        if (pos.getX() >> 4 == chunkPos.x && pos.getZ() >> 4 == chunkPos.z) return true;
++
++        return world.isNaturalSpawningAllowed((BlockPos) pos);
+     }
+ 
+     // Paper start - PreCreatureSpawnEvent
+@@ -379,9 +390,7 @@ public final class NaturalSpawner {
+         return squaredDistance > (double) (entity.getType().getCategory().getDespawnDistance() * entity.getType().getCategory().getDespawnDistance()) && entity.removeWhenFarAway(squaredDistance) ? false : entity.checkSpawnRules(world, MobSpawnType.NATURAL) && entity.checkSpawnObstruction(world);
+     }
+ 
+-    private static Optional<MobSpawnSettings.SpawnerData> getRandomSpawnMobAt(ServerLevel world, StructureManager structureAccessor, ChunkGenerator chunkGenerator, MobCategory spawnGroup, RandomSource random, BlockPos pos) {
+-        Holder<Biome> holder = world.getBiome(pos);
+-
++    private static Optional<MobSpawnSettings.SpawnerData> getRandomSpawnMobAt(ServerLevel world, StructureManager structureAccessor, ChunkGenerator chunkGenerator, MobCategory spawnGroup, RandomSource random, BlockPos pos, Holder<Biome> holder) { // Leaf - optimize mob spawning
+         return spawnGroup == MobCategory.WATER_AMBIENT && holder.is(BiomeTags.REDUCED_WATER_AMBIENT_SPAWNS) && random.nextFloat() < 0.98F ? Optional.empty() : NaturalSpawner.mobsAt(world, structureAccessor, chunkGenerator, spawnGroup, pos, holder).getRandom(random);
+     }
+ 

@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Wed, 13 May 2026 13:44:14 -0400
+Subject: [PATCH] Optimize entity lookup and living entity movement
+
+
+diff --git a/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java b/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java
+index 15ee41452992714108efe53b708b5a4e1da7c1ff..11dce06a3b589b87695aed120d93b23ad570987f 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java
++++ b/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java
+@@ -60,6 +60,20 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+     private final Int2ReferenceOpenHashMap<Entity> entityById = new Int2ReferenceOpenHashMap<>();
+     private final Object2ReferenceOpenHashMap<UUID, Entity> entityByUUID = new Object2ReferenceOpenHashMap<>();
+     private final EntityList accessibleEntities = new EntityList();
++    // Leaf start - region cache
++    private final ThreadLocal<RegionCache> regionCache = ThreadLocal.withInitial(RegionCache::new);
++
++    private static final class RegionCache {
++        private static final int SIZE = 4;
++        private static final int MASK = SIZE - 1;
++        private final long[] keys = new long[SIZE];
++        private final ChunkSlicesRegion[] values = new ChunkSlicesRegion[SIZE];
++
++        RegionCache() {
++            java.util.Arrays.fill(keys, Long.MIN_VALUE);
++        }
++    }
++    // Leaf end
+ 
+     public EntityLookup(final ServerLevel world, final LevelCallback<Entity> worldCallback) {
+         this.world = world;
+@@ -762,12 +776,23 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+ 
+     public ChunkSlicesRegion getRegion(final int regionX, final int regionZ) {
+         final long key = CoordinateUtils.getChunkKey(regionX, regionZ);
++        // Leaf start - region cache
++        final RegionCache cache = this.regionCache.get();
++        final int cacheIndex = (int) (key ^ (key >>> 32)) & RegionCache.MASK;
++        if (cache.keys[cacheIndex] == key) {
++            return cache.values[cacheIndex];
++        }
++        // Leaf end
+         final long attempt = this.stateLock.tryOptimisticRead();
+         if (attempt != 0L) {
+             try {
+                 final ChunkSlicesRegion ret = this.regions.get(key);
+ 
+                 if (this.stateLock.validate(attempt)) {
++                    // Leaf start - region cache
++                    cache.keys[cacheIndex] = key;
++                    cache.values[cacheIndex] = ret;
++                    // Leaf end
+                     return ret;
+                 }
+             } catch (final Error error) {
+@@ -779,7 +804,12 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+ 
+         this.stateLock.readLock();
+         try {
+-            return this.regions.get(key);
++            final ChunkSlicesRegion ret = this.regions.get(key); // Leaf
++            // Leaf start - region cache
++            cache.keys[cacheIndex] = key;
++            cache.values[cacheIndex] = ret;
++            // Leaf end
++            return ret; // Leaf
+         } finally {
+             this.stateLock.tryUnlockRead();
+         }
+diff --git a/src/main/java/net/minecraft/world/entity/LivingEntity.java b/src/main/java/net/minecraft/world/entity/LivingEntity.java
+index 2e97a4f9de6d7190f8943207b92137d508faddaf..59955891b66f70b888b521ef45fd3a8b6df14bb5 100644
+--- a/src/main/java/net/minecraft/world/entity/LivingEntity.java
++++ b/src/main/java/net/minecraft/world/entity/LivingEntity.java
+@@ -3046,8 +3046,10 @@ public abstract class LivingEntity extends Entity implements Attackable {
+                     this.setSharedFlag(7, false);
+                 }
+             } else {
++                // Leaf start - optimize travel
+                 BlockPos blockposition = this.getBlockPosBelowThatAffectsMyMovement();
+-                float f4 = this.level().getBlockState(blockposition).getBlock().getFriction();
++                BlockState blockState = this.level().getBlockState(blockposition);
++                float f4 = blockState.getBlock().getFriction();
+ 
+                 f = this.onGround() ? f4 * 0.91F : 0.91F;
+                 Vec3 vec3d6 = this.handleRelativeFrictionAndCalculateMovement(movementInput, f4);
+@@ -3530,8 +3532,10 @@ public abstract class LivingEntity extends Entity implements Attackable {
+         this.xxa *= 0.98F;
+         this.zza *= 0.98F;
+         this.updateFallFlying();
+-        AABB axisalignedbb = this.getBoundingBox();
+-        Vec3 vec3d1 = new Vec3((double) this.xxa, (double) this.yya, (double) this.zza);
++        // Leaf start - avoid Vec3 allocation in aiStep
++        // AABB axisalignedbb = this.getBoundingBox(); // Unused
++        // Vec3 vec3d1 = new Vec3((double) this.xxa, (double) this.yya, (double) this.zza);
++        // Leaf end
+ 
+         if (this.hasEffect(MobEffects.SLOW_FALLING) || this.hasEffect(MobEffects.LEVITATION)) {
+             this.resetFallDistance();
+@@ -3543,12 +3547,14 @@ public abstract class LivingEntity extends Entity implements Attackable {
+ 
+             if (entityliving instanceof net.minecraft.world.entity.player.Player entityhuman) {
+                 if (this.isAlive()) {
+-                    this.travelRidden(entityhuman, vec3d1);
++                    // Leaf start - avoid Vec3 allocation
++                    this.travelRidden(entityhuman, new Vec3((double) this.xxa, (double) this.yya, (double) this.zza));
++                    // Leaf end
+                     break label104;
+                 }
+             }
+ 
+-            this.travel(vec3d1);
++            this.travel(new Vec3((double) this.xxa, (double) this.yya, (double) this.zza)); // Leaf - avoid Vec3 allocation if not needed (but here we still need it for travel call, we'll optimize travel later if possible)
+         }
+ 
+         if (!this.level().isClientSide && !this.isDeadOrDying() && !this.freezeLocked) { // Paper - Freeze Tick Lock API

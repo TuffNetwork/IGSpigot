@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Wed, 13 May 2026 12:21:47 -0400
+Subject: [PATCH] Optimize NearbyPlayers
+
+
+diff --git a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+index 10465a33d90a1e43b9dbd7764c895dd39ef11b1a..311ac59b85b54dc2ad94f2ab9ddd203c4b53cca7 100644
+--- a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
++++ b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+@@ -38,6 +38,21 @@ public final class NearbyPlayers {
+     private final Reference2ReferenceOpenHashMap<ServerPlayer, TrackedPlayer[]> players = new Reference2ReferenceOpenHashMap<>();
+     private final Long2ReferenceOpenHashMap<TrackedChunk> byChunk = new Long2ReferenceOpenHashMap<>();
+ 
++    // Leaf start - optimize nearby players - last-accessed cache
++    private TrackedChunk lastValue;
++    private volatile long lastKey = Long.MAX_VALUE;
++
++    private TrackedChunk getChunkInternal(long key) {
++        if (key == this.lastKey) {
++            return this.lastValue;
++        }
++        TrackedChunk value = this.byChunk.get(key);
++        this.lastValue = value;
++        this.lastKey = key;
++        return value;
++    }
++    // Leaf end
++
+     public NearbyPlayers(final ServerLevel world) {
+         this.world = world;
+     }
+@@ -87,41 +102,41 @@ public final class NearbyPlayers {
+     }
+ 
+     public TrackedChunk getChunk(final ChunkPos pos) {
+-        return this.byChunk.get(CoordinateUtils.getChunkKey(pos));
++        return this.getChunkInternal(CoordinateUtils.getChunkKey(pos));
+     }
+ 
+     public TrackedChunk getChunk(final BlockPos pos) {
+-        return this.byChunk.get(CoordinateUtils.getChunkKey(pos));
++        return this.getChunkInternal(CoordinateUtils.getChunkKey(pos));
+     }
+ 
+     public ReferenceList<ServerPlayer> getPlayers(final BlockPos pos, final NearbyMapType type) {
+-        final TrackedChunk chunk = this.byChunk.get(CoordinateUtils.getChunkKey(pos));
++        final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(pos));
+ 
+         return chunk == null ? null : chunk.players[type.ordinal()];
+     }
+ 
+     public ReferenceList<ServerPlayer> getPlayers(final ChunkPos pos, final NearbyMapType type) {
+-        final TrackedChunk chunk = this.byChunk.get(CoordinateUtils.getChunkKey(pos));
++        final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(pos));
+ 
+         return chunk == null ? null : chunk.players[type.ordinal()];
+     }
+ 
+     // SparklyPaper start - cache coordinate key used for nearby players
+     public ReferenceList<ServerPlayer> getPlayers(final long nearbyPlayersCoordinateKey, final NearbyMapType type) {
+-        final TrackedChunk chunk = this.byChunk.get(nearbyPlayersCoordinateKey);
++        final TrackedChunk chunk = this.getChunkInternal(nearbyPlayersCoordinateKey);
+ 
+         return chunk == null ? null : chunk.players[type.ordinal()];
+     }
+     // SparklyPaper end
+ 
+     public ReferenceList<ServerPlayer> getPlayersByChunk(final int chunkX, final int chunkZ, final NearbyMapType type) {
+-        final TrackedChunk chunk = this.byChunk.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
++        final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+ 
+         return chunk == null ? null : chunk.players[type.ordinal()];
+     }
+ 
+     public ReferenceList<ServerPlayer> getPlayersByBlock(final int blockX, final int blockZ, final NearbyMapType type) {
+-        final TrackedChunk chunk = this.byChunk.get(CoordinateUtils.getChunkKey(blockX >> 4, blockZ >> 4));
++        final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(blockX >> 4, blockZ >> 4));
+ 
+         return chunk == null ? null : chunk.players[type.ordinal()];
+     }
+@@ -200,7 +215,7 @@ public final class NearbyPlayers {
+         protected void removeCallback(final ServerPlayer parameter, final int chunkX, final int chunkZ) {
+             final long chunkKey = CoordinateUtils.getChunkKey(chunkX, chunkZ);
+ 
+-            final TrackedChunk chunk = NearbyPlayers.this.byChunk.get(chunkKey);
++            final TrackedChunk chunk = NearbyPlayers.this.getChunkInternal(chunkKey);
+             if (chunk == null) {
+                 throw new IllegalStateException("Chunk should exist at " + new ChunkPos(chunkKey));
+             }
+@@ -209,6 +224,7 @@ public final class NearbyPlayers {
+ 
+             if (chunk.isEmpty()) {
+                 NearbyPlayers.this.byChunk.remove(chunkKey);
++                if (NearbyPlayers.this.lastKey == chunkKey) NearbyPlayers.this.lastKey = Long.MAX_VALUE;
+             }
+         }
+     }

@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Wed, 13 May 2026 12:34:52 -0400
+Subject: [PATCH] Further spawning and spatial query optimizations
+
+
+diff --git a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+index 311ac59b85b54dc2ad94f2ab9ddd203c4b53cca7..df4e13708aef638cc7427db744048c409991b26f 100644
+--- a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
++++ b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+@@ -38,17 +38,19 @@ public final class NearbyPlayers {
+     private final Reference2ReferenceOpenHashMap<ServerPlayer, TrackedPlayer[]> players = new Reference2ReferenceOpenHashMap<>();
+     private final Long2ReferenceOpenHashMap<TrackedChunk> byChunk = new Long2ReferenceOpenHashMap<>();
+ 
+-    // Leaf start - optimize nearby players - last-accessed cache
+-    private TrackedChunk lastValue;
+-    private volatile long lastKey = Long.MAX_VALUE;
++    // Leaf start - optimize nearby players - multi-slot cache
++    private final TrackedChunk[] cacheValues = new TrackedChunk[8];
++    private final long[] cacheKeys = new long[8];
++    { java.util.Arrays.fill(this.cacheKeys, Long.MAX_VALUE); }
+ 
+     private TrackedChunk getChunkInternal(long key) {
+-        if (key == this.lastKey) {
+-            return this.lastValue;
++        int hash = (int) (key ^ (key >>> 32)) & 7;
++        if (this.cacheKeys[hash] == key) {
++            return this.cacheValues[hash];
+         }
+         TrackedChunk value = this.byChunk.get(key);
+-        this.lastValue = value;
+-        this.lastKey = key;
++        this.cacheValues[hash] = value;
++        this.cacheKeys[hash] = key;
+         return value;
+     }
+     // Leaf end
+@@ -224,7 +226,8 @@ public final class NearbyPlayers {
+ 
+             if (chunk.isEmpty()) {
+                 NearbyPlayers.this.byChunk.remove(chunkKey);
+-                if (NearbyPlayers.this.lastKey == chunkKey) NearbyPlayers.this.lastKey = Long.MAX_VALUE;
++                int hash = (int) (chunkKey ^ (chunkKey >>> 32)) & 7;
++                if (NearbyPlayers.this.cacheKeys[hash] == chunkKey) NearbyPlayers.this.cacheKeys[hash] = Long.MAX_VALUE;
+             }
+         }
+     }
+diff --git a/src/main/java/net/minecraft/world/entity/EntityType.java b/src/main/java/net/minecraft/world/entity/EntityType.java
+index 4714cbf21f4edb41ee07c7eac180a6806afb7e9e..6eb6541e0b7b0b132b0257a5aac857dc4fc9fc7a 100644
+--- a/src/main/java/net/minecraft/world/entity/EntityType.java
++++ b/src/main/java/net/minecraft/world/entity/EntityType.java
+@@ -328,6 +328,15 @@ public class EntityType<T extends Entity> implements FeatureElement, EntityTypeT
+     public void setDimensions(EntityDimensions dimensions) { this.dimensions = dimensions; } // Purpur
+     private final float spawnDimensionsScale;
+     private final FeatureFlagSet requiredFeatures;
++    // Leaf start - optimize bukkit conversion
++    private org.bukkit.entity.EntityType bukkitType;
++    public org.bukkit.entity.EntityType getBukkitType() {
++        if (this.bukkitType == null) {
++            this.bukkitType = org.bukkit.craftbukkit.entity.CraftEntityType.minecraftToBukkit(this);
++        }
++        return this.bukkitType;
++    }
++    // Leaf end
+ 
+     private static <T extends Entity> EntityType<T> register(String id, EntityType.Builder type) { // CraftBukkit - decompile error
+         return (EntityType) Registry.register(BuiltInRegistries.ENTITY_TYPE, id, (EntityType<T>) type.build(id)); // CraftBukkit - decompile error
+diff --git a/src/main/java/net/minecraft/world/level/NaturalSpawner.java b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+index a6132f24f03b6991392a9dbae02ca3e755a8d15b..2a83d75318da2f76118d28ec81859683ea418d76 100644
+--- a/src/main/java/net/minecraft/world/level/NaturalSpawner.java
++++ b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+@@ -355,7 +355,7 @@ public final class NaturalSpawner {
+         // Paper start - PreCreatureSpawnEvent
+         com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent event = new com.destroystokyo.paper.event.entity.PreCreatureSpawnEvent(
+             io.papermc.paper.util.MCUtil.toLocation(world, pos),
+-            org.bukkit.craftbukkit.entity.CraftEntityType.minecraftToBukkit(entitytypes), SpawnReason.NATURAL
++            entitytypes.getBukkitType(), SpawnReason.NATURAL // Leaf - optimize mob spawning - use cached bukkit type
+         );
+         if (!event.callEvent()) {
+             if (event.shouldAbortSpawn()) {
