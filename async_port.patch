@@ -1,0 +1,1253 @@
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ConcurrentCollections.java b/src/main/java/io/papermc/paper/threadedregions/ConcurrentCollections.java
+new file mode 100644
+index 000000000..839ab7910
+--- /dev/null
++++ b/src/main/java/io/papermc/paper/threadedregions/ConcurrentCollections.java
+@@ -0,0 +1,47 @@
++package io.papermc.paper.threadedregions;
++
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.stream.Collectors;
++
++/**
++ * Factory methods for creating thread-safe collection instances.
++ * Provides convenient methods to create concurrent collections with standard interfaces.
++ */
++public class ConcurrentCollections {
++
++    /**
++     * Creates a new thread-safe set
++     *
++     * @param <T> the type of elements maintained by this set
++     * @return a new concurrent hash set
++     */
++    public static <T> Set<T> newHashSet() {
++        return Collections.newSetFromMap(new ConcurrentHashMap<>());
++    }
++
++    /**
++     * Creates a new thread-safe map
++     *
++     * @param <T> the type of keys maintained by this map
++     * @param <U> the type of mapped values
++     * @return a new concurrent hash map
++     */
++    public static <T, U> Map<T, U> newHashMap() {
++        return new ConcurrentHashMap<>();
++    }
++
++    /**
++     * Creates a collector that accumulates elements into a thread-safe list
++     *
++     * @param <T> the type of elements in the list
++     * @return a collector that accumulates elements into a CopyOnWriteArrayList
++     */
++    public static <T> java.util.stream.Collector<T, ?, List<T>> toList() {
++        return Collectors.toCollection(CopyOnWriteArrayList::new);
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+new file mode 100644
+index 000000000..1dbcd3303
+--- /dev/null
++++ b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+@@ -0,0 +1,250 @@
++package io.papermc.paper.threadedregions;
++
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.EntityType;
++import net.minecraft.world.entity.item.FallingBlockEntity;
++import net.minecraft.world.entity.monster.Shulker;
++import net.minecraft.world.entity.projectile.Projectile;
++import net.minecraft.world.entity.vehicle.AbstractMinecart;
++import net.minecraft.world.entity.vehicle.Boat;
++import net.minecraft.world.level.chunk.LevelChunk;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++import java.lang.ref.WeakReference;
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.concurrent.atomic.AtomicInteger;
++
++public class ParallelProcessor {
++    public static final Logger LOGGER = LogManager.getLogger(ParallelProcessor.class);
++
++    private static MinecraftServer server;
++
++    public static MinecraftServer getServer() {
++        return server;
++    }
++
++    public static void setServer(MinecraftServer server) {
++        ParallelProcessor.server = server;
++    }
++
++    public static final AtomicInteger currentEntities = new AtomicInteger();
++    private static final AtomicInteger threadPoolID = new AtomicInteger();
++    public static ExecutorService tickPool;
++    private static final Set<UUID> blacklistedEntity = ConcurrentHashMap.newKeySet();
++    private static final Map<String, Set<WeakReference<Thread>>> mcThreadTracker = new ConcurrentHashMap<>();
++    public static final Set<Class<?>> BLOCKED_ENTITIES = Set.of(
++            FallingBlockEntity.class,
++            Shulker.class,
++            Boat.class
++    );
++    private static volatile boolean isShuttingDown = false;
++
++    public static void setupThreadPool(int parallelism) {
++        isShuttingDown = false;
++        ThreadFactory threadFactory = runnable -> {
++            Thread thread = new Thread(runnable,
++                    "Async-Tick-Pool-Thread-" + threadPoolID.getAndIncrement());
++            registerThread("Async-Tick", thread);
++            thread.setDaemon(false);
++            thread.setPriority(Thread.NORM_PRIORITY - 1);
++            return thread;
++        };
++        ThreadPoolExecutor executor = new ThreadPoolExecutor(
++                parallelism,
++                parallelism,
++                0L, TimeUnit.MILLISECONDS,
++                new LinkedBlockingQueue<>(),
++                threadFactory
++        );
++        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardPolicy());
++        executor.allowCoreThreadTimeOut(false);
++        executor.prestartAllCoreThreads();
++        tickPool = executor;
++        LOGGER.info("Initialized Pool with {} threads", parallelism);
++    }
++
++    public static void registerThread(String poolName, Thread thread) {
++        mcThreadTracker
++                .computeIfAbsent(poolName, key -> ConcurrentHashMap.newKeySet())
++                .add(new WeakReference<>(thread));
++    }
++
++    private static boolean isThreadInPool(Thread thread) {
++        return mcThreadTracker.getOrDefault("Async-Tick", Set.of()).stream()
++                .map(WeakReference::get)
++                .anyMatch(thread::equals);
++    }
++
++    public static boolean isServerExecutionThread() {
++        return isThreadInPool(Thread.currentThread());
++    }
++
++    public static int getPoolSize() {
++        return ((ThreadPoolExecutor) tickPool).getCorePoolSize();
++    }
++
++    @SuppressWarnings("unchecked")
++    public static void callChunkTickBatch(ServerLevel world, List<LevelChunk> chunks, int randomTickSpeed) {
++        if (chunks.isEmpty()) return;
++        if (ParallelProcessor.tickPool == null || ParallelProcessor.tickPool.isShutdown()) {
++            chunks.forEach(c -> world.tickChunk(c, randomTickSpeed));
++            return;
++        }
++
++        int poolSize = getPoolSize();
++        int batchSize = (chunks.size() + poolSize - 1) / poolSize;
++
++        List<Future<?>> futures = new ArrayList<>();
++        for (int i = 0; i < chunks.size(); i += batchSize) {
++            List<LevelChunk> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
++            Future<?> future = tickPool.submit(() -> {
++                for (LevelChunk chunk : batch) {
++                    try {
++                        world.tickChunk(chunk, randomTickSpeed);
++                    } catch (Throwable t) {
++                        LOGGER.error("Error in async chunk tick", t);
++                    }
++                }
++                return null;
++            });
++            futures.add(future);
++        }
++
++        boolean allDone;
++        do {
++            allDone = futures.stream().allMatch(Future::isDone);
++            if (!allDone) {
++                boolean pumped = false;
++                if (server != null) {
++                    for (ServerLevel lvl : server.getAllLevels()) {
++                        pumped |= lvl.getChunkSource().pollTask();
++                    }
++                }
++                if (!pumped) {
++                    Thread.onSpinWait();
++                }
++            }
++        } while (!allDone);
++
++        for (Future<?> future : futures) {
++            try {
++                future.get();
++            } catch (Exception e) {
++                LOGGER.error("Error in async chunk tick batch", e);
++            }
++        }
++    }
++
++    public static void callEntityTickBatch(ServerLevel world, List<Entity> entities) {
++        if (entities.isEmpty()) return;
++        if (ParallelProcessor.tickPool == null || ParallelProcessor.tickPool.isShutdown()) {
++            entities.forEach(e -> tickSynchronously(world, e));
++            return;
++        }
++
++        int poolSize = getPoolSize();
++        int chunkSize = (entities.size() + poolSize - 1) / poolSize;
++
++        List<Future<?>> futures = new ArrayList<>();
++        for (int i = 0; i < entities.size(); i += chunkSize) {
++            List<Entity> chunk = entities.subList(i, Math.min(i + chunkSize, entities.size()));
++            Future<?> future = tickPool.submit(() -> {
++                for (Entity entity : chunk) {
++                    if (shouldTickSynchronously(entity)) continue;
++                    performAsyncEntityTick(world, entity);
++                }
++            });
++            futures.add(future);
++        }
++
++        for (Entity e : entities) {
++            if (shouldTickSynchronously(e)) {
++                tickSynchronously(world, e);
++            }
++        }
++
++        boolean allDone;
++        do {
++            allDone = futures.stream().allMatch(Future::isDone);
++            if (!allDone) {
++                boolean pumped = false;
++                for (ServerLevel lvl : server.getAllLevels()) {
++                    pumped |= lvl.getChunkSource().pollTask();
++                }
++                if (!pumped) {
++                    Thread.onSpinWait();
++                }
++            }
++        } while (!allDone);
++
++        for (Future<?> future : futures) {
++            try {
++                future.get();
++            } catch (Exception e) {
++                LOGGER.error("Error in async entity tick", e);
++            }
++        }
++    }
++
++    public static boolean shouldTickSynchronously(Entity entity) {
++        if (isShuttingDown) {
++            return true;
++        }
++        if (entity.level().isClientSide()) {
++            return true;
++        }
++
++        UUID entityId = entity.getUUID();
++
++        return entity instanceof Projectile ||
++                entity instanceof AbstractMinecart ||
++                entity instanceof ServerPlayer ||
++                BLOCKED_ENTITIES.contains(entity.getClass()) ||
++                blacklistedEntity.contains(entityId);
++    }
++
++    private static void tickSynchronously(ServerLevel world, Entity entity) {
++        try {
++            world.tickNonPassenger(entity);
++        } catch (Throwable throwable) {
++            if (throwable instanceof ThreadDeath) throw (ThreadDeath) throwable;
++            final String msg = String.format("Entity threw exception at %s:%s,%s,%s", entity.level().getWorld().getName(), entity.getX(), entity.getY(), entity.getZ());
++            LOGGER.error(msg, throwable);
++            entity.discard();
++        }
++    }
++
++    private static void performAsyncEntityTick(ServerLevel world, Entity entity) {
++        currentEntities.incrementAndGet();
++        try {
++            world.tickNonPassenger(entity);
++        } catch (Throwable throwable) {
++            if (throwable instanceof ThreadDeath) throw (ThreadDeath) throwable;
++            final String msg = String.format("Entity threw exception at %s:%s,%s,%s", entity.level().getWorld().getName(), entity.getX(), entity.getY(), entity.getZ());
++            LOGGER.error(msg, throwable);
++            entity.discard();
++        } finally {
++            currentEntities.decrementAndGet();
++        }
++    }
++
++    @SuppressWarnings("ResultOfMethodCallIgnored")
++    public static void stop() {
++        isShuttingDown = true;
++        if (tickPool != null) {
++            LOGGER.info("Waiting for Async tickPool to shutdown...");
++            tickPool.shutdown();
++            try {
++                tickPool.awaitTermination(60L, TimeUnit.SECONDS);
++            } catch (InterruptedException ignored) {
++            }
++        }
++        blacklistedEntity.clear();
++    }
++
++}
+diff --git a/src/main/java/com/destroystokyo/paper/util/maplist/EntityList.java b/src/main/java/com/destroystokyo/paper/util/maplist/EntityList.java
+index 85f223ffe..b59a6a8a7 100644
+--- a/src/main/java/com/destroystokyo/paper/util/maplist/EntityList.java
++++ b/src/main/java/com/destroystokyo/paper/util/maplist/EntityList.java
+@@ -21,15 +21,15 @@ public final class EntityList implements Iterable<Entity> {
+     protected Entity[] entities = ArrayConstants.emptyEntityArray; // Gale - JettPack - reduce array allocations
+     protected int count;
+ 
+-    public int size() {
++    public synchronized int size() {
+         return this.count;
+     }
+ 
+-    public boolean contains(final Entity entity) {
++    public synchronized boolean contains(final Entity entity) {
+         return this.entityToIndex.containsKey(entity.getId());
+     }
+ 
+-    public boolean remove(final Entity entity) {
++    public synchronized boolean remove(final Entity entity) {
+         final int index = this.entityToIndex.remove(entity.getId());
+         if (index == Integer.MIN_VALUE) {
+             return false;
+@@ -48,7 +48,7 @@ public final class EntityList implements Iterable<Entity> {
+         return true;
+     }
+ 
+-    public boolean add(final Entity entity) {
++    public synchronized boolean add(final Entity entity) {
+         final int count = this.count;
+         final int currIndex = this.entityToIndex.putIfAbsent(entity.getId(), count);
+ 
+@@ -84,7 +84,7 @@ public final class EntityList implements Iterable<Entity> {
+         return this.entities;
+     }
+ 
+-    public void clear() {
++    public synchronized void clear() {
+         this.entityToIndex.clear();
+         Arrays.fill(this.entities, 0, this.count, null);
+         this.count = 0;
+diff --git a/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java b/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java
+index 11dce06a3..976b31e71 100644
+--- a/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java
++++ b/src/main/java/io/papermc/paper/chunk/system/entity/EntityLookup.java
+@@ -61,6 +61,7 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+     private final Object2ReferenceOpenHashMap<UUID, Entity> entityByUUID = new Object2ReferenceOpenHashMap<>();
+     private final EntityList accessibleEntities = new EntityList();
+     // Leaf start - region cache
++    private final java.util.concurrent.atomic.AtomicInteger regionCacheVersion = new java.util.concurrent.atomic.AtomicInteger();
+     private final ThreadLocal<RegionCache> regionCache = ThreadLocal.withInitial(RegionCache::new);
+ 
+     private static final class RegionCache {
+@@ -68,6 +69,7 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+         private static final int MASK = SIZE - 1;
+         private final long[] keys = new long[SIZE];
+         private final ChunkSlicesRegion[] values = new ChunkSlicesRegion[SIZE];
++        private int version = -1;
+ 
+         RegionCache() {
+             java.util.Arrays.fill(keys, Long.MIN_VALUE);
+@@ -778,6 +780,11 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+         final long key = CoordinateUtils.getChunkKey(regionX, regionZ);
+         // Leaf start - region cache
+         final RegionCache cache = this.regionCache.get();
++        final int globalVersion = this.regionCacheVersion.get();
++        if (cache.version != globalVersion) {
++            java.util.Arrays.fill(cache.keys, Long.MIN_VALUE);
++            cache.version = globalVersion;
++        }
+         final int cacheIndex = (int) (key ^ (key >>> 32)) & RegionCache.MASK;
+         if (cache.keys[cacheIndex] == key) {
+             return cache.values[cacheIndex];
+@@ -826,6 +833,7 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+             this.stateLock.writeLock();
+             try {
+                 this.regions.remove(key);
++                this.regionCacheVersion.incrementAndGet(); // Leaf - region cache
+             } finally {
+                 this.stateLock.tryUnlockWrite();
+             }
+@@ -845,6 +853,7 @@ public final class EntityLookup implements LevelEntityGetter<Entity> {
+             this.stateLock.writeLock();
+             try {
+                 this.regions.put(key, region);
++                this.regionCacheVersion.incrementAndGet(); // Leaf - region cache
+             } finally {
+                 this.stateLock.tryUnlockWrite();
+             }
+diff --git a/src/main/java/io/papermc/paper/util/TickThread.java b/src/main/java/io/papermc/paper/util/TickThread.java
+index b9ea1ae71..de2be0d54 100644
+--- a/src/main/java/io/papermc/paper/util/TickThread.java
++++ b/src/main/java/io/papermc/paper/util/TickThread.java
+@@ -180,7 +180,7 @@ public class TickThread extends Thread {
+     }
+ 
+     public static boolean isTickThread() {
+-        return Thread.currentThread() instanceof TickThread;
++        return Thread.currentThread() instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isShutdownThread() {
+@@ -192,7 +192,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final ChunkPos pos) {
+@@ -200,7 +200,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final Vec3 pos) {
+@@ -208,7 +208,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final int chunkX, final int chunkZ) {
+@@ -216,7 +216,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final AABB aabb) {
+@@ -224,7 +224,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final double blockX, final double blockZ) {
+@@ -232,7 +232,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final Vec3 position, final Vec3 deltaMovement, final int buffer) {
+@@ -240,7 +240,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final int fromChunkX, final int fromChunkZ, final int toChunkX, final int toChunkZ) {
+@@ -248,7 +248,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final ServerLevel world, final int chunkX, final int chunkZ, final int radius) {
+@@ -256,7 +256,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     // SparklyPaper - parallel world ticking
+@@ -267,7 +267,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == world;
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     public static boolean isTickThreadFor(final Entity entity) {
+@@ -279,7 +279,7 @@ public class TickThread extends Thread {
+ 
+         if (currentThread instanceof ServerLevelTickThread serverLevelTickThread) {
+             return serverLevelTickThread.currentlyTickingServerLevel == entity.level();
+-        } else return currentThread instanceof TickThread;
++        } else return currentThread instanceof TickThread || io.papermc.paper.threadedregions.ParallelProcessor.isServerExecutionThread();
+     }
+ 
+     // SparklyPaper start - parallel world ticking
+diff --git a/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java b/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
+index 63aa94b00..11f8571ac 100644
+--- a/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
++++ b/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
+@@ -3,7 +3,7 @@ package io.papermc.paper.world;
+ import com.destroystokyo.paper.util.maplist.EntityList;
+ import io.papermc.paper.chunk.system.entity.EntityLookup;
+ import it.unimi.dsi.fastutil.objects.Reference2ObjectMap;
+-import it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap;
++import java.util.concurrent.ConcurrentHashMap;
+ import me.titaniumtown.ArrayConstants;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.server.level.ChunkHolder;
+@@ -36,7 +36,7 @@ public final class ChunkEntitySlices {
+ 
+     protected final EntityCollectionBySection allEntities;
+     protected final EntityCollectionBySection hardCollidingEntities;
+-    protected final Reference2ObjectOpenHashMap<Class<? extends Entity>, EntityCollectionBySection> entitiesByClass;
++    protected final ConcurrentHashMap<Class<? extends Entity>, EntityCollectionBySection> entitiesByClass;
+     public final EntityList entities = new EntityList(); // Leaf - petal - protected -> public
+ 
+     public FullChunkStatus status;
+@@ -63,7 +63,7 @@ public final class ChunkEntitySlices {
+ 
+         this.allEntities = new EntityCollectionBySection(this);
+         this.hardCollidingEntities = new EntityCollectionBySection(this);
+-        this.entitiesByClass = new Reference2ObjectOpenHashMap<>();
++        this.entitiesByClass = new ConcurrentHashMap<>();
+ 
+         this.status = status;
+     }
+@@ -185,7 +185,7 @@ public final class ChunkEntitySlices {
+         this.preventStatusUpdates = prev;
+     }
+ 
+-    public void updateStatus(final FullChunkStatus status, final EntityLookup lookup) {
++    public synchronized void updateStatus(final FullChunkStatus status, final EntityLookup lookup) {
+         this.status = status;
+ 
+         final Entity[] entities = this.entities.getRawData();
+@@ -201,7 +201,7 @@ public final class ChunkEntitySlices {
+         }
+     }
+ 
+-    public boolean addEntity(final Entity entity, final int chunkSection) {
++    public synchronized boolean addEntity(final Entity entity, final int chunkSection) {
+         if (!this.entities.add(entity)) {
+             return false;
+         }
+@@ -214,10 +214,7 @@ public final class ChunkEntitySlices {
+             this.hardCollidingEntities.addEntity(entity, sectionIndex);
+         }
+ 
+-        for (final Iterator<Reference2ObjectMap.Entry<Class<? extends Entity>, EntityCollectionBySection>> iterator =
+-             this.entitiesByClass.reference2ObjectEntrySet().fastIterator(); iterator.hasNext();) {
+-            final Reference2ObjectMap.Entry<Class<? extends Entity>, EntityCollectionBySection> entry = iterator.next();
+-
++        for (java.util.Map.Entry<Class<? extends Entity>, EntityCollectionBySection> entry : this.entitiesByClass.entrySet()) {
+             if (entry.getKey().isInstance(entity)) {
+                 entry.getValue().addEntity(entity, sectionIndex);
+             }
+@@ -226,7 +223,7 @@ public final class ChunkEntitySlices {
+         return true;
+     }
+ 
+-    public boolean removeEntity(final Entity entity, final int chunkSection) {
++    public synchronized boolean removeEntity(final Entity entity, final int chunkSection) {
+         if (!this.entities.remove(entity)) {
+             return false;
+         }
+@@ -239,10 +236,7 @@ public final class ChunkEntitySlices {
+             this.hardCollidingEntities.removeEntity(entity, sectionIndex);
+         }
+ 
+-        for (final Iterator<Reference2ObjectMap.Entry<Class<? extends Entity>, EntityCollectionBySection>> iterator =
+-             this.entitiesByClass.reference2ObjectEntrySet().fastIterator(); iterator.hasNext();) {
+-            final Reference2ObjectMap.Entry<Class<? extends Entity>, EntityCollectionBySection> entry = iterator.next();
+-
++        for (java.util.Map.Entry<Class<? extends Entity>, EntityCollectionBySection> entry : this.entitiesByClass.entrySet()) {
+             if (entry.getKey().isInstance(entity)) {
+                 entry.getValue().removeEntity(entity, sectionIndex);
+             }
+@@ -251,19 +245,19 @@ public final class ChunkEntitySlices {
+         return true;
+     }
+ 
+-    public void getHardCollidingEntities(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
++    public synchronized void getHardCollidingEntities(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
+         this.hardCollidingEntities.getEntities(except, box, into, predicate);
+     }
+ 
+-    public void getEntities(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
++    public synchronized void getEntities(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
+         this.allEntities.getEntitiesWithEnderDragonParts(except, box, into, predicate);
+     }
+ 
+-    public void getEntitiesWithoutDragonParts(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
++    public synchronized void getEntitiesWithoutDragonParts(final Entity except, final AABB box, final List<Entity> into, final Predicate<? super Entity> predicate) {
+         this.allEntities.getEntities(except, box, into, predicate);
+     }
+ 
+-    public <T extends Entity> void getEntities(final EntityType<?> type, final AABB box, final List<? super T> into,
++    public synchronized <T extends Entity> void getEntities(final EntityType<?> type, final AABB box, final List<? super T> into,
+                                                final Predicate<? super T> predicate) {
+         this.allEntities.getEntities(type, box, (List)into, (Predicate)predicate);
+     }
+@@ -297,7 +291,11 @@ public final class ChunkEntitySlices {
+         if (collection != null) {
+             collection.getEntitiesWithEnderDragonParts(except, clazz, box, (List)into, (Predicate)predicate);
+         } else {
+-            this.entitiesByClass.putIfAbsent(clazz, collection = this.initClass(clazz));
++            EntityCollectionBySection newCollection = this.initClass(clazz);
++            collection = this.entitiesByClass.putIfAbsent(clazz, newCollection);
++            if (collection == null) {
++                collection = newCollection;
++            }
+             collection.getEntitiesWithEnderDragonParts(except, clazz, box, (List)into, (Predicate)predicate);
+         }
+     }
+@@ -334,7 +332,7 @@ public final class ChunkEntitySlices {
+             }
+         }
+ 
+-        public void add(final E entity) {
++        public synchronized void add(final E entity) {
+             final int idx = this.size++;
+             if (idx >= this.storage.length) {
+                 this.resize();
+@@ -356,7 +354,7 @@ public final class ChunkEntitySlices {
+             return -1;
+         }
+ 
+-        public boolean remove(final E entity) {
++        public synchronized boolean remove(final E entity) {
+             final int idx = this.indexOf(entity);
+             if (idx == -1) {
+                 return false;
+@@ -394,7 +392,7 @@ public final class ChunkEntitySlices {
+             this.entitiesBySection = new BasicEntityList[sectionCount];
+         }
+ 
+-        public void addEntity(final Entity entity, final int sectionIndex) {
++        public synchronized void addEntity(final Entity entity, final int sectionIndex) {
+             BasicEntityList<Entity> list = this.entitiesBySection[sectionIndex];
+ 
+             if (list != null && list.has(entity)) {
+@@ -410,7 +408,7 @@ public final class ChunkEntitySlices {
+             ++this.count;
+         }
+ 
+-        public void removeEntity(final Entity entity, final int sectionIndex) {
++        public synchronized void removeEntity(final Entity entity, final int sectionIndex) {
+             final BasicEntityList<Entity> list = this.entitiesBySection[sectionIndex];
+ 
+             if (list == null || !list.remove(entity)) {
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 8dc1ec398..3b888b0ea 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -942,6 +942,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             if (this.hasStopped) return;
+             this.hasStopped = true;
+         }
++        io.papermc.paper.threadedregions.ParallelProcessor.stop();
+         if (!hasLoggedStop && isDebugging()) io.papermc.paper.util.TraceUtil.dumpTraceForThread("Server stopped"); // Paper - Debugging
+         // Paper start - kill main thread, and kill it hard
+         shutdownThread = Thread.currentThread();
+@@ -1142,6 +1143,8 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+ 
+     protected void runServer() {
+         try {
++            io.papermc.paper.threadedregions.ParallelProcessor.setServer(this);
++            io.papermc.paper.threadedregions.ParallelProcessor.setupThreadPool(Runtime.getRuntime().availableProcessors());
+             long serverStartTime = Util.getNanos(); // Paper
+             if (!this.initServer()) {
+                 throw new IllegalStateException("Failed to initialize server");
+@@ -1572,6 +1575,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     }
+ 
+     public void tickServer(BooleanSupplier shouldKeepTicking) {
++        org.dreeam.leaf.optimization.ai.LazyAIIntegration.onTick(); // Leaf - LazyAI
+         long i = Util.getNanos();
+ 
+         // Paper start - move oversleep into full server tick
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 700b8713e..f73333bf0 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -586,6 +586,7 @@ public class ServerChunkCache extends ChunkSource {
+                     Util.shuffle(shuffled, this.level.random);
+                     chunkIterator = shuffled.iterator();
+                 }
++                List<LevelChunk> chunksToTick = new java.util.ArrayList<>();
+                 try {
+                 // Paper end - optimise chunk tick iteration
+                 while (chunkIterator.hasNext()) {
+@@ -623,11 +624,12 @@ public class ServerChunkCache extends ChunkSource {
+                         }
+ 
+                         if (true || this.level.shouldTickBlocksAt(chunkcoordintpair.toLong())) { // Paper - optimise chunk tick iteration
+-                            this.level.tickChunk(chunk1, l);
+-                            if ((chunksTicked++ & 1) == 0) net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks(); // Paper
++                            chunksToTick.add(chunk1);
+                         }
+                     }
+                 }
++                io.papermc.paper.threadedregions.ParallelProcessor.callChunkTickBatch(this.level, chunksToTick, l);
++
+                 // Paper start - optimise chunk tick iteration
+                 } finally {
+                     if (chunkIterator instanceof io.papermc.paper.util.maplist.IteratorSafeOrderedReferenceSet.Iterator safeIterator) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 967a616a7..a6e451818 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -13,8 +13,10 @@ import it.unimi.dsi.fastutil.objects.Object2IntMap.Entry;
+ import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+ import it.unimi.dsi.fastutil.objects.ObjectIterator;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import io.papermc.paper.threadedregions.ConcurrentCollections;
+ import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
+-import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+ import java.io.BufferedWriter;
+ import java.io.IOException;
+ import java.io.Writer;
+@@ -201,7 +203,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private static final int EMPTY_TIME_NO_TICK = 300;
+     private static final int MAX_SCHEDULED_TICKS_PER_TICK = 65536;
+-    final List<ServerPlayer> players;
++    final List<ServerPlayer> players = new CopyOnWriteArrayList<>();
+     public final ServerChunkCache chunkSource;
+     private final MinecraftServer server;
+     public final PrimaryLevelData serverLevelData; // CraftBukkit - type
+@@ -216,10 +218,11 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     private final LevelTicks<Block> blockTicks;
+     private final LevelTicks<Fluid> fluidTicks;
+     private final PathTypeCache pathTypesByPosCache;
+-    final Set<Mob> navigatingMobs;
++    private static final Object explosionLock = new Object();
++    final Set<Mob> navigatingMobs = ConcurrentCollections.newHashSet();
+     volatile boolean isUpdatingNavigations;
+     protected final Raids raids;
+-    private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents;
++    private final ConcurrentLinkedQueue<BlockEventData> blockEvents = new ConcurrentLinkedQueue<>();
+     private final List<BlockEventData> blockEventsToReschedule;
+     private boolean handlingTick;
+     private final List<CustomSpawner> customSpawners;
+@@ -714,15 +717,15 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         this.convertable = convertable_conversionsession;
+         this.uuid = WorldUUID.getUUID(convertable_conversionsession.levelDirectory.path().toFile());
+         // CraftBukkit end
+-        this.players = Lists.newArrayList();
++        // this.players = Lists.newArrayList(); // Handled in field init
+         this.entityTickList = new EntityTickList();
+         // Gale start - Purpur - remove vanilla profiler
+         this.blockTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+         this.fluidTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded);
+         // Gale end - Purpur - remove vanilla profiler
+         this.pathTypesByPosCache = new PathTypeCache();
+-        this.navigatingMobs = new ObjectOpenHashSet();
+-        this.blockEvents = new ObjectLinkedOpenHashSet();
++        // this.navigatingMobs = new ObjectOpenHashSet(); // Handled in field init
++        // this.blockEvents = new ObjectLinkedOpenHashSet(); // Handled in field init
+         this.blockEventsToReschedule = new ArrayList(64);
+         this.dragonParts = new Int2ObjectOpenHashMap();
+         this.tickTime = flag1;
+@@ -911,42 +914,26 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+ 
+             org.spigotmc.ActivationRange.activateEntities(this); // Spigot
++            List<Entity> entitiesToTick = new java.util.ArrayList<>();
+             this.entityTickList.forEach((entity) -> {
+                 entity.activatedPriorityReset = false; // Pufferfish - DAB
+                 if (!entity.isRemoved()) {
+-                    if (false && this.shouldDiscardEntity(entity)) { // CraftBukkit - We prevent spawning in general, so this butchering is not needed
+-                        entity.discard();
+-                    } else if (!tickratemanager.isEntityFrozen(entity)) {
++                    if (!tickratemanager.isEntityFrozen(entity)) {
+                         entity.checkDespawn();
+-                        if (true || this.chunkSource.chunkMap.getDistanceManager().inEntityTickingRange(entity.chunkPosition().toLong())) { // Paper - now always true if in the ticking list
+-                            Entity entity1 = entity.getVehicle();
+-
+-                            if (entity1 != null) {
+-                                if (!entity1.isRemoved() && entity1.hasPassenger(entity)) {
++                        if (this.chunkSource.chunkMap.getDistanceManager().inEntityTickingRange(entity.chunkPosition().toLong())) {
++                            Entity vehicle = entity.getVehicle();
++                            if (vehicle != null) {
++                                if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
+                                     return;
+                                 }
+-
+                                 entity.stopRiding();
+                             }
+-
+-                        // Gale start - Airplane - remove lambda from ticking guard - copied from guardEntityTick
+-                        try {
+-                            this.tickNonPassenger(entity); // Gale - Airplane - remove lambda from ticking guard - changed
+-                            MinecraftServer.getServer().executeMidTickTasks(); // Tuinity - execute chunk tasks mid tick
+-                        } catch (Throwable throwable) {
+-                            if (throwable instanceof ThreadDeath) throw throwable; // Paper
+-                            // Paper start - Prevent tile entity and entity crashes
+-                            final String msg = String.format("Entity threw exception at %s:%s,%s,%s", entity.level().getWorld().getName(), entity.getX(), entity.getY(), entity.getZ());
+-                            MinecraftServer.LOGGER.error(msg, throwable);
+-                            getCraftServer().getPluginManager().callEvent(new com.destroystokyo.paper.event.server.ServerExceptionEvent(new com.destroystokyo.paper.exception.ServerInternalException(msg, throwable)));
+-                            entity.discard();
+-                            // Paper end
+-                        }
+-                        // Gale end - Airplane - remove lambda from ticking guard - copied from guardEntityTick
++                            entitiesToTick.add(entity);
+                         }
+                     }
+                 }
+             });
++            io.papermc.paper.threadedregions.ParallelProcessor.callEntityTickBatch(this, entitiesToTick);
+             this.tickBlockEntities();
+         }
+ 
+@@ -1021,29 +1008,30 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         });
+     }
+     // Paper start - optimise random block ticking
+-    private final BlockPos.MutableBlockPos chunkTickMutablePosition = new BlockPos.MutableBlockPos();
+-    // Paper end
+-
+-    private int currentIceAndSnowTick = 0; protected void resetIceAndSnowTick() { this.currentIceAndSnowTick = this.randomTickRandom.nextInt(16); } // Gale - Airplane - optimize random calls in chunk ticking
++    private final java.util.concurrent.atomic.AtomicInteger currentIceAndSnowTick = new java.util.concurrent.atomic.AtomicInteger(0);
++    protected void resetIceAndSnowTick() { this.currentIceAndSnowTick.set(this.random.nextInt(16)); }
+ 
+     public void tickChunk(LevelChunk chunk, int randomTickSpeed) {
+         ChunkPos chunkcoordintpair = chunk.getPos();
+         boolean flag = this.isRaining();
+         int j = chunkcoordintpair.getMinBlockX();
+         int k = chunkcoordintpair.getMinBlockZ();
+-        final BlockPos.MutableBlockPos blockposition = this.chunkTickMutablePosition; // Paper - use mutable to reduce allocation rate, final to force compile fail on change
++        final BlockPos.MutableBlockPos blockposition = new BlockPos.MutableBlockPos();
++        final net.minecraft.util.RandomSource randomTickRandom = net.minecraft.util.RandomSource.createThreadSafe();
+ 
+-        if (!this.paperConfig().environment.disableThunder && flag && this.isThundering() && this.spigotConfig.thunderChance > 0 && /*this.random.nextInt(this.spigotConfig.thunderChance) == 0 &&*/ chunk.shouldDoLightning(this.random)) { // Spigot // Paper - Option to disable thunder // Gale - Airplane - optimize random calls in chunk ticking - replace random with shouldDoLightning
+-            blockposition.set(this.findLightningTargetAround(this.getBlockRandomPos(j, 0, k, 15))); // Paper
++        if (!this.paperConfig().environment.disableThunder && flag && this.isThundering() && this.spigotConfig.thunderChance > 0 && /*this.random.nextInt(this.spigotConfig.thunderChance) == 0 &&*/ chunk.shouldDoLightning(randomTickRandom)) { // Spigot // Paper - Option to disable thunder // Gale - Airplane - optimize random calls in chunk ticking - replace random with shouldDoLightning
++            int i1 = randomTickRandom.nextInt();
++            blockposition.set(j + (i1 & 15), this.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, j + (i1 & 15), k + (i1 >> 8 & 15)), k + (i1 >> 8 & 15)); // Inline thread-safe getBlockRandomPos
++            blockposition.set(this.findLightningTargetAround(blockposition.immutable())); // Paper
+ 
+             if (this.isRainingAt(blockposition)) {
+                 DifficultyInstance difficultydamagescaler = this.getCurrentDifficultyAt(blockposition);
+-                boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && this.random.nextDouble() < (double) difficultydamagescaler.getEffectiveDifficulty() * this.paperConfig().entities.spawning.skeletonHorseThunderSpawnChance.or(0.01D) && !this.getBlockState(blockposition.below()).is(Blocks.LIGHTNING_ROD); // Paper - Configurable spawn chances for skeleton horses
++                boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && randomTickRandom.nextDouble() < (double) difficultydamagescaler.getEffectiveDifficulty() * this.paperConfig().entities.spawning.skeletonHorseThunderSpawnChance.or(0.01D) && !this.getBlockState(blockposition.below()).is(Blocks.LIGHTNING_ROD); // Paper - Configurable spawn chances for skeleton horses
+ 
+                 if (flag1) {
+                     // Purpur start
+                     net.minecraft.world.entity.animal.horse.AbstractHorse entityhorseskeleton;
+-                    if (purpurConfig.zombieHorseSpawnChance > 0D && random.nextDouble() <= purpurConfig.zombieHorseSpawnChance) {
++                    if (purpurConfig.zombieHorseSpawnChance > 0D && randomTickRandom.nextDouble() <= purpurConfig.zombieHorseSpawnChance) {
+                         entityhorseskeleton = EntityType.ZOMBIE_HORSE.create(this);
+                     } else {
+                         entityhorseskeleton = EntityType.SKELETON_HORSE.create(this);
+@@ -1069,11 +1057,12 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+         }
+ 
+-        if (!this.paperConfig().environment.disableIceAndSnow && (this.currentIceAndSnowTick++ & 15) == 0) { // Paper - Option to disable ice and snow // Gale - Airplane - optimize random calls in chunk ticking - optimize further random ticking
++        if (!this.paperConfig().environment.disableIceAndSnow && (this.currentIceAndSnowTick.getAndIncrement() & 15) == 0) { // Paper - Option to disable ice and snow // Gale - Airplane - optimize random calls in chunk ticking - optimize further random ticking
+         for (int l = 0; l < randomTickSpeed; ++l) {
+-            if (this.random.nextInt(48) == 0) {
++            if (randomTickRandom.nextInt(48) == 0) {
+                 // Paper start
+-                this.getRandomBlockPosition(j, 0, k, 15, blockposition);
++                int i2 = randomTickRandom.nextInt();
++                blockposition.set(j + (i2 & 15), this.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, j + (i2 & 15), k + (i2 >> 8 & 15)), k + (i2 >> 8 & 15)); // Inline thread-safe getRandomBlockPosition
+                 this.tickPrecipitation(blockposition, chunk);
+                 // Paper end
+             }
+@@ -1091,7 +1080,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+                 int yPos = (sectionIndex + minSection) << 4;
+                 for (int a = 0; a < randomTickSpeed; ++a) {
+                     int tickingBlocks = section.tickingList.size();
+-                    int index = this.randomTickRandom.nextInt(16 * 16 * 16);
++                    int index = randomTickRandom.nextInt(16 * 16 * 16);
+                     if (index >= tickingBlocks) {
+                         continue;
+                     }
+@@ -1105,7 +1094,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+                     BlockPos blockposition2 = blockposition.set(j + randomX, randomY, k + randomZ);
+                     BlockState iblockdata = com.destroystokyo.paper.util.maplist.IBlockDataList.getBlockDataFromRaw(raw);
+ 
+-                    iblockdata.randomTick(this, blockposition2.immutable(), this.randomTickRandom); // Gale - JettPack - reduce array allocations
++                    iblockdata.randomTick(this, blockposition2.immutable(), randomTickRandom); // Gale - JettPack - reduce array allocations
+                 }
+                 // We drop the fluid tick since LAVA is ALREADY TICKED by the above method (See LiquidBlock).
+                 // TODO CHECK ON UPDATE (ping the Canadian)
+@@ -1894,21 +1883,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+         if (Shapes.joinIsNotEmpty(voxelshape, voxelshape1, BooleanOp.NOT_SAME)) {
+             List<PathNavigation> list = new ObjectArrayList();
+-            Iterator iterator = this.navigatingMobs.iterator();
+-
+-            while (iterator.hasNext()) {
+-                // CraftBukkit start - fix SPIGOT-6362
+-                Mob entityinsentient;
+-                try {
+-                    entityinsentient = (Mob) iterator.next();
+-                } catch (java.util.ConcurrentModificationException ex) {
+-                    // This can happen because the pathfinder update below may trigger a chunk load, which in turn may cause more navigators to register
+-                    // In this case we just run the update again across all the iterators as the chunk will then be loaded
+-                    // As this is a relative edge case it is much faster than copying navigators (on either read or write)
+-                    this.sendBlockUpdated(pos, oldState, newState, flags);
+-                    return;
+-                }
+-                // CraftBukkit end
++            for (Mob entityinsentient : this.navigatingMobs) {
+                 PathNavigation navigationabstract = entityinsentient.getNavigation();
+ 
+                 if (navigationabstract.shouldRecomputePath(pos)) {
+@@ -1918,11 +1893,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+             try {
+                 this.isUpdatingNavigations = true;
+-                iterator = list.iterator();
+-
+-                while (iterator.hasNext()) {
+-                    PathNavigation navigationabstract1 = (PathNavigation) iterator.next();
+-
++                for (PathNavigation navigationabstract1 : list) {
+                     navigationabstract1.recomputePath();
+                 }
+             } finally {
+@@ -1971,28 +1942,26 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+     @Override
+     public Explosion explode(@Nullable Entity entity, @Nullable DamageSource damageSource, @Nullable ExplosionDamageCalculator behavior, double x, double y, double z, float power, boolean createFire, Level.ExplosionInteraction explosionSourceType, ParticleOptions particle, ParticleOptions emitterParticle, Holder<SoundEvent> soundEvent) {
+-        Explosion explosion = this.explode(entity, damageSource, behavior, x, y, z, power, createFire, explosionSourceType, false, particle, emitterParticle, soundEvent);
+-        // CraftBukkit start
+-        if (explosion.wasCanceled) {
+-            return explosion;
+-        }
+-        // CraftBukkit end
+-
+-        if (!explosion.interactsWithBlocks()) {
+-            explosion.clearToBlow();
+-        }
+-
+-        Iterator iterator = this.players.iterator();
++        synchronized (explosionLock) {
++            Explosion explosion = this.explode(entity, damageSource, behavior, x, y, z, power, createFire, explosionSourceType, false, particle, emitterParticle, soundEvent);
++            // CraftBukkit start
++            if (explosion.wasCanceled) {
++                return explosion;
++            }
++            // CraftBukkit end
+ 
+-        while (iterator.hasNext()) {
+-            ServerPlayer entityplayer = (ServerPlayer) iterator.next();
++            if (!explosion.interactsWithBlocks()) {
++                explosion.clearToBlow();
++            }
+ 
+-            if (entityplayer.distanceToSqr(x, y, z) < 4096.0D) {
+-                entityplayer.connection.send(new ClientboundExplodePacket(x, y, z, power, explosion.getToBlow(), (Vec3) explosion.getHitPlayers().get(entityplayer), explosion.getBlockInteraction(), explosion.getSmallExplosionParticles(), explosion.getLargeExplosionParticles(), explosion.getExplosionSound()));
++            for (ServerPlayer entityplayer : this.players) {
++                if (entityplayer.distanceToSqr(x, y, z) < 4096.0D) {
++                    entityplayer.connection.send(new ClientboundExplodePacket(x, y, z, power, explosion.getToBlow(), (Vec3) explosion.getHitPlayers().get(entityplayer), explosion.getBlockInteraction(), explosion.getSmallExplosionParticles(), explosion.getLargeExplosionParticles(), explosion.getExplosionSound()));
++                }
+             }
+-        }
+ 
+-        return explosion;
++            return explosion;
++        }
+     }
+ 
+     @Override
+@@ -2004,7 +1973,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         this.blockEventsToReschedule.clear();
+ 
+         while (!this.blockEvents.isEmpty()) {
+-            BlockEventData blockactiondata = (BlockEventData) this.blockEvents.removeFirst();
++            BlockEventData blockactiondata = (BlockEventData) this.blockEvents.poll();
+ 
+             if (this.shouldTickBlocksAt(blockactiondata.pos())) {
+                 if (this.doBlockEvent(blockactiondata)) {
+diff --git a/src/main/java/net/minecraft/world/entity/LivingEntity.java b/src/main/java/net/minecraft/world/entity/LivingEntity.java
+index 59955891b..94631b78c 100644
+--- a/src/main/java/net/minecraft/world/entity/LivingEntity.java
++++ b/src/main/java/net/minecraft/world/entity/LivingEntity.java
+@@ -3533,7 +3533,7 @@ public abstract class LivingEntity extends Entity implements Attackable {
+         this.zza *= 0.98F;
+         this.updateFallFlying();
+         // Leaf start - avoid Vec3 allocation in aiStep
+-        // AABB axisalignedbb = this.getBoundingBox(); // Unused
++        AABB axisalignedbb = this.getBoundingBox();
+         // Vec3 vec3d1 = new Vec3((double) this.xxa, (double) this.yya, (double) this.zza);
+         // Leaf end
+ 
+@@ -3689,6 +3689,7 @@ public abstract class LivingEntity extends Entity implements Attackable {
+         if (this.level().isClientSide()) {
+             this.level().getEntities(EntityTypeTest.forClass(net.minecraft.world.entity.player.Player.class), this.getBoundingBox(), EntitySelector.pushableBy(this)).forEach(this::doPush);
+         } else {
++            if (org.dreeam.leaf.optimization.ai.LazyAIIntegration.shouldSkipPushTick(this)) return; // Leaf - LazyAI
+             // Paper start - don't run getEntities if we're not going to use its result
+             if (!this.isPushable()) {
+                 return;
+diff --git a/src/main/java/net/minecraft/world/entity/Mob.java b/src/main/java/net/minecraft/world/entity/Mob.java
+index e14ba4cf6..6689aa9e0 100644
+--- a/src/main/java/net/minecraft/world/entity/Mob.java
++++ b/src/main/java/net/minecraft/world/entity/Mob.java
+@@ -977,18 +977,9 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Targeti
+         }
+     }
+ 
+-    @Override
+-    protected final void serverAiStep() {
+-        ++this.noActionTime;
+-        // Paper start - Allow nerfed mobs to jump and float
+-        if (!this.aware) {
+-            if (goalFloat != null) {
+-                if (goalFloat.canUse()) goalFloat.tick();
+-                this.getJumpControl().tick();
+-            }
+-            return;
+-        }
+-        // Paper end - Allow nerfed mobs to jump and float
++    public void tickAI() {
++        if (!this.aware) return;
++        if (org.dreeam.leaf.optimization.ai.LazyAIIntegration.shouldSkipGoalTick(this)) return; // Leaf - LazyAI
+ 
+         this.sensing.tick();
+         int i = this.tickCount + this.getId();
+@@ -1004,11 +995,27 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Targeti
+             if (this.goalSelector.inactiveTick(this.activatedPriority, false)) // Pufferfish - use this to alternate ticking
+             this.goalSelector.tick();
+         }
++    }
++
++    @Override
++    protected final void serverAiStep() {
++        ++this.noActionTime;
++        // Paper start - Allow nerfed mobs to jump and float
++        if (!this.aware) {
++            if (goalFloat != null) {
++                if (goalFloat.canUse()) goalFloat.tick();
++                this.getJumpControl().tick();
++            }
++            return;
++        }
++        // Paper end - Allow nerfed mobs to jump and float
++
++        this.tickAI();
+ 
+         this.navigation.tick();
+         this.customServerAiStep();
+         this.moveControl.tick();
+-        this.lookControl.tick();
++        if (!org.dreeam.leaf.optimization.ai.LazyAIIntegration.shouldSkipLookTick(this)) this.lookControl.tick();
+         this.jumpControl.tick();
+         this.sendDebugPackets();
+     }
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index ca353627f..7a6468865 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -178,6 +178,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+ 
+     public final com.destroystokyo.paper.antixray.ChunkPacketBlockController chunkPacketBlockController; // Paper - Anti-Xray
+     public final org.purpurmc.purpur.PurpurWorldConfig purpurConfig; // Purpur
++    public static final boolean DEBUG_TICK_AUTOSAVE = Boolean.getBoolean("debug.tick.autosave");
++    private static final Object EXPLOSION_LOCK = new Object();
+     public static BlockPos lastPhysicsProblem; // Spigot
+     private org.spigotmc.TickLimiter entityLimiter;
+     private org.spigotmc.TickLimiter tileLimiter;
+@@ -1435,39 +1437,41 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+     }
+ 
+     public Explosion explode(@Nullable Entity entity, @Nullable DamageSource damageSource, @Nullable ExplosionDamageCalculator behavior, double x, double y, double z, float power, boolean createFire, Level.ExplosionInteraction explosionSourceType, boolean particles, ParticleOptions particle, ParticleOptions emitterParticle, Holder<SoundEvent> soundEvent) {
+-        Explosion.BlockInteraction explosion_effect;
+-
+-        switch (explosionSourceType.ordinal()) {
+-            case 0:
+-                explosion_effect = Explosion.BlockInteraction.KEEP;
+-                break;
+-            case 1:
+-                explosion_effect = this.getDestroyType(GameRules.RULE_BLOCK_EXPLOSION_DROP_DECAY);
+-                break;
+-            case 2:
+-                explosion_effect = this.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING) ? this.getDestroyType(GameRules.RULE_MOB_EXPLOSION_DROP_DECAY) : Explosion.BlockInteraction.KEEP;
+-                break;
+-            case 3:
+-                explosion_effect = this.getDestroyType(GameRules.RULE_TNT_EXPLOSION_DROP_DECAY);
+-                break;
+-            case 4:
+-                explosion_effect = Explosion.BlockInteraction.TRIGGER_BLOCK;
+-                break;
+-            // CraftBukkit start - handle custom explosion type
+-            case 5:
+-                explosion_effect = Explosion.BlockInteraction.DESTROY;
+-                break;
+-            // CraftBukkit end
+-            default:
+-                throw new MatchException((String) null, (Throwable) null);
+-        }
++        synchronized (EXPLOSION_LOCK) {
++            Explosion.BlockInteraction explosion_effect;
++
++            switch (explosionSourceType.ordinal()) {
++                case 0:
++                    explosion_effect = Explosion.BlockInteraction.KEEP;
++                    break;
++                case 1:
++                    explosion_effect = this.getDestroyType(GameRules.RULE_BLOCK_EXPLOSION_DROP_DECAY);
++                    break;
++                case 2:
++                    explosion_effect = this.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING) ? this.getDestroyType(GameRules.RULE_MOB_EXPLOSION_DROP_DECAY) : Explosion.BlockInteraction.KEEP;
++                    break;
++                case 3:
++                    explosion_effect = this.getDestroyType(GameRules.RULE_TNT_EXPLOSION_DROP_DECAY);
++                    break;
++                case 4:
++                    explosion_effect = Explosion.BlockInteraction.TRIGGER_BLOCK;
++                    break;
++                // CraftBukkit start - handle custom explosion type
++                case 5:
++                    explosion_effect = Explosion.BlockInteraction.DESTROY;
++                    break;
++                // CraftBukkit end
++                default:
++                    throw new MatchException((String) null, (Throwable) null);
++            }
+ 
+-        Explosion.BlockInteraction explosion_effect1 = explosion_effect;
+-        Explosion explosion = new Explosion(this, entity, damageSource, behavior, x, y, z, power, createFire, explosion_effect1, particle, emitterParticle, soundEvent);
++            Explosion.BlockInteraction explosion_effect1 = explosion_effect;
++            Explosion explosion = new Explosion(this, entity, damageSource, behavior, x, y, z, power, createFire, explosion_effect1, particle, emitterParticle, soundEvent);
+ 
+-        explosion.explode();
+-        explosion.finalizeExplosion(particles);
+-        return explosion;
++            explosion.explode();
++            explosion.finalizeExplosion(particles);
++            return explosion;
++        }
+     }
+ 
+     private Explosion.BlockInteraction getDestroyType(GameRules.Key<GameRules.BooleanValue> gameRuleKey) {
+diff --git a/src/main/java/net/minecraft/world/level/NaturalSpawner.java b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+index 2a83d7531..99dc59f32 100644
+--- a/src/main/java/net/minecraft/world/level/NaturalSpawner.java
++++ b/src/main/java/net/minecraft/world/level/NaturalSpawner.java
+@@ -148,7 +148,10 @@ public final class NaturalSpawner {
+             }
+ 
+             // Paper start - Optional per player mob spawns; only allow spawns upto the limit per chunk and update count afterwards
+-            int currEntityCount = info.mobCategoryCounts.getInt(enumcreaturetype);
++            int currEntityCount;
++            synchronized (info) {
++                currEntityCount = info.mobCategoryCounts.getInt(enumcreaturetype);
++            }
+             int k1 = limit * info.getSpawnableChunkCount() / NaturalSpawner.MAGIC_NUMBER;
+             int difference = k1 - currEntityCount;
+ 
+@@ -174,7 +177,9 @@ public final class NaturalSpawner {
+                 // Paper start - Optional per player mob spawns
+                 int spawnCount = NaturalSpawner.spawnCategoryForChunk(enumcreaturetype, world, chunk, spawnercreature_c, info::afterSpawn,
+                     difference, world.paperConfig().entities.spawning.perPlayerMobSpawns ? world.getChunkSource().chunkMap::updatePlayerMobTypeMap : null);
+-                info.mobCategoryCounts.mergeInt(enumcreaturetype, spawnCount, Integer::sum);
++                synchronized (info) {
++                    info.mobCategoryCounts.mergeInt(enumcreaturetype, spawnCount, Integer::sum);
++                }
+                 // Paper end - Optional per player mob spawns
+             }
+         }
+@@ -545,7 +550,7 @@ public final class NaturalSpawner {
+             this.unmodifiableMobCategoryCounts = Object2IntMaps.unmodifiable(groupToCount);
+         }
+ 
+-        private boolean canSpawn(EntityType<?> type, BlockPos pos, ChunkAccess chunk) {
++        private synchronized boolean canSpawn(EntityType<?> type, BlockPos pos, ChunkAccess chunk) {
+             this.lastCheckedPos = pos;
+             this.lastCheckedType = type;
+             MobSpawnSettings.MobSpawnCost biomesettingsmobs_b = NaturalSpawner.getRoughBiome(pos, chunk).getMobSettings().getMobSpawnCost(type);
+@@ -563,7 +568,7 @@ public final class NaturalSpawner {
+             }
+         }
+ 
+-        private void afterSpawn(Mob entity, ChunkAccess chunk) {
++        private synchronized void afterSpawn(Mob entity, ChunkAccess chunk) {
+             EntityType<?> entitytypes = entity.getType();
+             BlockPos blockposition = entity.blockPosition();
+             double d0;
+@@ -596,7 +601,7 @@ public final class NaturalSpawner {
+         }
+ 
+         // CraftBukkit start
+-        boolean canSpawnForCategory(MobCategory enumcreaturetype, ChunkPos chunkcoordintpair, int limit) {
++        synchronized boolean canSpawnForCategory(MobCategory enumcreaturetype, ChunkPos chunkcoordintpair, int limit) {
+             int i = limit * this.spawnableChunkCount / NaturalSpawner.MAGIC_NUMBER;
+             // CraftBukkit end
+ 
+diff --git a/src/main/java/net/minecraft/world/level/block/CropBlock.java b/src/main/java/net/minecraft/world/level/block/CropBlock.java
+index b150e700b..24263ccd0 100644
+--- a/src/main/java/net/minecraft/world/level/block/CropBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/CropBlock.java
+@@ -87,7 +87,7 @@ public class CropBlock extends BushBlock implements BonemealableBlock {
+                     // Is the block below us moisturised?
+                     BlockPos farmlandBelowTheCurrentBlock = pos.below();
+                     BlockState farmlandBelowTheCurrentBlockData = world.getBlockState(farmlandBelowTheCurrentBlock);
+-                    float f = org.dreeam.leaf.config.modules.opt.BlazinglySimpleFarmChecks.defaultGrowthSpeed;
++                    double f = org.dreeam.leaf.config.modules.opt.BlazinglySimpleFarmChecks.defaultGrowthSpeed;
+                     boolean isCurrentFarmlandStateMoist = false;
+                     if (farmlandBelowTheCurrentBlockData.is(Blocks.FARMLAND)) {
+                         if ((Integer) farmlandBelowTheCurrentBlockData.getValue(FarmBlock.MOISTURE) > 0) {
+diff --git a/src/main/java/net/minecraft/world/level/block/StemBlock.java b/src/main/java/net/minecraft/world/level/block/StemBlock.java
+index e547bad87..316fe7fb1 100644
+--- a/src/main/java/net/minecraft/world/level/block/StemBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/StemBlock.java
+@@ -79,7 +79,7 @@ public class StemBlock extends BushBlock implements BonemealableBlock {
+                 // Is the block below us moisturised?
+                 BlockPos farmlandBelowTheCurrentBlock = pos.below();
+                 BlockState farmlandBelowTheCurrentBlockData = world.getBlockState(farmlandBelowTheCurrentBlock);
+-                float f = org.dreeam.leaf.config.modules.opt.BlazinglySimpleFarmChecks.defaultGrowthSpeed;
++                double f = org.dreeam.leaf.config.modules.opt.BlazinglySimpleFarmChecks.defaultGrowthSpeed;
+                 boolean isCurrentFarmlandStateMoist = false;
+                 if (farmlandBelowTheCurrentBlockData.is(Blocks.FARMLAND)) {
+                     if ((Integer) farmlandBelowTheCurrentBlockData.getValue(FarmBlock.MOISTURE) > 0) {
+diff --git a/src/main/java/org/dreeam/leaf/config/modules/opt/BlazinglySimpleFarmChecks.java b/src/main/java/org/dreeam/leaf/config/modules/opt/BlazinglySimpleFarmChecks.java
+index c1921685b..8b0067fcc 100644
+--- a/src/main/java/org/dreeam/leaf/config/modules/opt/BlazinglySimpleFarmChecks.java
++++ b/src/main/java/org/dreeam/leaf/config/modules/opt/BlazinglySimpleFarmChecks.java
+@@ -20,10 +20,10 @@ public class BlazinglySimpleFarmChecks implements IConfigModule {
+     public static boolean enabled = false;
+ 
+     @ConfigInfo(baseName = "default_growth_speed")
+-    public static float defaultGrowthSpeed = 1.0f;
++    public static double defaultGrowthSpeed = 1.0;
+ 
+     @ConfigInfo(baseName = "moist_growth_speed")
+-    public static float moistGrowthSpeed = 5.0f;
++    public static double moistGrowthSpeed = 5.0;
+ 
+     @ConfigInfo(baseName = "skip_middle_aging_stages_for_crops")
+     public static boolean skipMiddleAgingStagesForCrops = true;
