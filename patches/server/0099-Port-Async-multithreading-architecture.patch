@@ -1075,7 +1075,7 @@ index e14ba4cf64b7bfff6b6e3630e56d84a5b6fb42b4..6689aa9e0cc61da22abbddf664d6cc15
          this.sendDebugPackets();
      }
 diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
-index ca353627f4e72337ca4a3d4092056c3f68524c75..7a64688650befa0e4cc8ad372255274c6b54f6a9 100644
+index ca353627f4e72337ca4a3d4092056c3f68524c75..61999b446ff970e879b7235a53533002093d59f9 100644
 --- a/src/main/java/net/minecraft/world/level/Level.java
 +++ b/src/main/java/net/minecraft/world/level/Level.java
 @@ -178,6 +178,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
@@ -1087,7 +1087,38 @@ index ca353627f4e72337ca4a3d4092056c3f68524c75..7a64688650befa0e4cc8ad372255274c
      public static BlockPos lastPhysicsProblem; // Spigot
      private org.spigotmc.TickLimiter entityLimiter;
      private org.spigotmc.TickLimiter tileLimiter;
-@@ -1435,39 +1437,41 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+@@ -314,7 +316,29 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         this.thread = Thread.currentThread();
+         this.biomeManager = new BiomeManager(this, i);
+         this.isDebug = flag1;
+-        this.neighborUpdater = new CollectingNeighborUpdater(this, j);
++        final int maxChainDepth = j;
++        final ThreadLocal<NeighborUpdater> localNeighborUpdater = ThreadLocal.withInitial(() -> new CollectingNeighborUpdater(this, maxChainDepth));
++        this.neighborUpdater = new NeighborUpdater() {
++            @Override
++            public void shapeUpdate(Direction direction, BlockState neighborState, BlockPos pos, BlockPos neighborPos, int flags, int maxUpdateDepth) {
++                localNeighborUpdater.get().shapeUpdate(direction, neighborState, pos, neighborPos, flags, maxUpdateDepth);
++            }
++
++            @Override
++            public void neighborChanged(BlockPos pos, Block sourceBlock, BlockPos sourcePos) {
++                localNeighborUpdater.get().neighborChanged(pos, sourceBlock, sourcePos);
++            }
++
++            @Override
++            public void neighborChanged(BlockState state, BlockPos pos, Block sourceBlock, BlockPos sourcePos, boolean notify) {
++                localNeighborUpdater.get().neighborChanged(state, pos, sourceBlock, sourcePos, notify);
++            }
++
++            @Override
++            public void updateNeighborsAtExceptFromFacing(BlockPos pos, Block sourceBlock, @Nullable Direction except) {
++                localNeighborUpdater.get().updateNeighborsAtExceptFromFacing(pos, sourceBlock, except);
++            }
++        };
+         this.registryAccess = iregistrycustom;
+         this.damageSources = new DamageSources(iregistrycustom);
+         // CraftBukkit start
+@@ -1435,39 +1459,41 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
      }
  
      public Explosion explode(@Nullable Entity entity, @Nullable DamageSource damageSource, @Nullable ExplosionDamageCalculator behavior, double x, double y, double z, float power, boolean createFire, Level.ExplosionInteraction explosionSourceType, boolean particles, ParticleOptions particle, ParticleOptions emitterParticle, Holder<SoundEvent> soundEvent) {
