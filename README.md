@@ -6,14 +6,11 @@
 </div>
 
 ## 🤣 USPIGOT DISS
+
 Y'all bums violating the GPL License 🤣🤣🤣
-
 uspigot devs so broke they're overpricing their slop 🤣
-
 igspigot makes more money than uspigot
-
 bunch of jobless bums charging money off free shit
-
 uspigot, more like, trahs 🤣🤣🤣🤣🤣🤣🤣
 
 =======
