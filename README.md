@@ -8,7 +8,6 @@
 ## 🤣 USPIGOT DISS
 Y'all bums violating the GPL License 🤣🤣🤣
 
-<<<<<<< patch-1
 uspigot devs so broke they're overpricing their slop 🤣
 
 igspigot solos
