@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 11:02:03 -0400
+Subject: [PATCH] Implement Multithreaded Player Networking
+
+
+diff --git a/src/main/java/net/minecraft/network/protocol/PacketUtils.java b/src/main/java/net/minecraft/network/protocol/PacketUtils.java
+index d6daa27a8d7aca00b181e90d789f4249e8437d29..3698bc741dcdb43e5fe8635108a8a8b566e24d9b 100644
+--- a/src/main/java/net/minecraft/network/protocol/PacketUtils.java
++++ b/src/main/java/net/minecraft/network/protocol/PacketUtils.java
+@@ -37,6 +37,33 @@ public class PacketUtils {
+     }
+     // Paper end - detailed watchdog information
+ 
++    private static final java.util.concurrent.ExecutorService ASYNC_PACKET_EXECUTOR = java.util.concurrent.Executors.newFixedThreadPool(
++        Math.max(1, Runtime.getRuntime().availableProcessors() / 2),
++        new com.google.common.util.concurrent.ThreadFactoryBuilder().setNameFormat("leaf-async-packet-%d").setPriority(Thread.NORM_PRIORITY - 1).build()
++    );
++
++    private static boolean isAsyncSafe(Packet<?> packet) {
++        String name = packet.getClass().getSimpleName();
++        return name.contains("ServerboundClientInformationPacket") ||
++               name.contains("ServerboundCustomPayloadPacket") ||
++               name.contains("ServerboundKeepAlivePacket") ||
++               name.contains("ServerboundPingRequestPacket") ||
++               name.contains("ServerboundPongResponsePacket") ||
++               name.contains("ServerboundResourcePackPacket") ||
++               name.contains("ServerboundCookieResponsePacket") ||
++               name.contains("ServerboundSeenAdvancementsPacket") ||
++               name.contains("ServerboundMovePlayerPacket") ||
++               name.contains("ServerboundPlayerInputPacket") ||
++               name.contains("ServerboundSwingPacket") ||
++               name.contains("ServerboundInteractPacket") ||
++               name.contains("ServerboundClientCommandPacket") ||
++               name.contains("ServerboundAcceptTeleportationPacket");
++    }
++
++    public static boolean isAsyncThread() {
++        return Thread.currentThread().getName().startsWith("leaf-async-packet-");
++    }
++
+     public PacketUtils() {}
+ 
+     public static <T extends PacketListener> void ensureRunningOnSameThread(Packet<T> packet, T listener, ServerLevel world) throws RunningOnDifferentThreadException {
+@@ -45,35 +72,40 @@ public class PacketUtils {
+ 
+     public static <T extends PacketListener> void ensureRunningOnSameThread(Packet<T> packet, T listener, BlockableEventLoop<?> engine) throws RunningOnDifferentThreadException {
+         if (!engine.isSameThread()) {
+-            engine.executeIfPossible(() -> {
+-                packetProcessing.push(listener); // Paper - detailed watchdog information
+-                try { // Paper - detailed watchdog information
+-                if (listener instanceof ServerCommonPacketListenerImpl serverCommonPacketListener && serverCommonPacketListener.processedDisconnect) return; // CraftBukkit - Don't handle sync packets for kicked players
+-                if (listener.shouldHandleMessage(packet)) {
+-                    try {
+-                        packet.handle(listener);
+-                    } catch (Exception exception) {
+-                        if (exception instanceof ReportedException) {
+-                            ReportedException reportedexception = (ReportedException) exception;
+-
+-                            if (reportedexception.getCause() instanceof OutOfMemoryError) {
+-                                throw PacketUtils.makeReportedException(exception, packet, listener);
++            if (isAsyncSafe(packet) && isAsyncThread()) {
++                return;
++            }
++            java.util.function.Consumer<T> handler = (l) -> {
++                if (l instanceof net.minecraft.server.network.ServerGamePacketListenerImpl gameListener) gameListener.packetLock.lock();
++                packetProcessing.push(l);
++                try {
++                    if (l instanceof ServerCommonPacketListenerImpl serverCommonPacketListener && serverCommonPacketListener.processedDisconnect) return;
++                    if (l.shouldHandleMessage(packet)) {
++                        try {
++                            packet.handle(l);
++                        } catch (Exception exception) {
++                            if (exception instanceof ReportedException reportedexception) {
++                                if (reportedexception.getCause() instanceof OutOfMemoryError) {
++                                    throw PacketUtils.makeReportedException(exception, packet, l);
++                                }
+                             }
++                            l.onPacketError(packet, exception);
+                         }
+-
+-                        listener.onPacketError(packet, exception);
++                    } else {
++                        PacketUtils.LOGGER.debug("Ignoring packet due to disconnection: {}", packet);
+                     }
+-                } else {
+-                    PacketUtils.LOGGER.debug("Ignoring packet due to disconnection: {}", packet);
+-                }
+-                // Paper start - detailed watchdog information
+                 } finally {
+                     totalMainThreadPacketsProcessed.getAndIncrement();
+                     packetProcessing.pop();
++                    if (l instanceof net.minecraft.server.network.ServerGamePacketListenerImpl gameListener) gameListener.packetLock.unlock();
+                 }
+-                // Paper end - detailed watchdog information
++            };
+ 
+-            });
++            if (isAsyncSafe(packet)) {
++                ASYNC_PACKET_EXECUTOR.execute(() -> handler.accept(listener));
++            } else {
++                engine.executeIfPossible(() -> handler.accept(listener));
++            }
+             throw RunningOnDifferentThreadException.RUNNING_ON_DIFFERENT_THREAD;
+         }
+     }
+diff --git a/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index f41c6154c134fd6354b25e3f76458b565924af11..22e22d78da7e3f7ed48cf78cf1f642d280a57218 100644
+--- a/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -306,6 +306,7 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+     private final FutureChain chatMessageChain;
+     private boolean waitingForSwitchToConfig;
+     private static final int MAX_SIGN_LINE_LENGTH = Integer.getInteger("Paper.maxSignLength", 80); // Paper - Limit client sign length
++    public final java.util.concurrent.locks.ReentrantLock packetLock = new java.util.concurrent.locks.ReentrantLock(); // Leaf - multithreaded networking
+ 
+     public ServerGamePacketListenerImpl(MinecraftServer server, Connection connection, ServerPlayer player, CommonListenerCookie clientData) {
+         super(server, connection, clientData, player); // CraftBukkit
+@@ -352,6 +353,8 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+ 
+     @Override
+     public void tick() {
++        this.packetLock.lock();
++        try {
+         if (this.ackBlockChangesUpTo > -1) {
+             this.send(new ClientboundBlockChangedAckPacket(this.ackBlockChangesUpTo));
+             this.ackBlockChangesUpTo = -1;
+@@ -433,7 +436,9 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+             hasLoggedExpiry = true;
+         }
+         // Paper end - Prevent causing expired keys from impacting new joins
+-
++        } finally {
++            this.packetLock.unlock();
++        }
+     }
+ 
+     private int getMaximumFlyingTicks(Entity vehicle) {

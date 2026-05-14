@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 09:37:54 -0400
+Subject: [PATCH] Optimize NearbyPlayers cache and pre-size ArrayLists
+
+
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+index f87aac0b8de1b49d66305e1feab46845f4a26d1b..e4a3338a61a6f0053e0e2a1a096d9dfd8305a0da 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
++++ b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+@@ -107,7 +107,7 @@ public class ParallelProcessor {
+         int poolSize = getPoolSize();
+         int batchSize = (chunks.size() + poolSize - 1) / poolSize;
+ 
+-        List<Future<?>> futures = new ArrayList<>();
++        List<Future<?>> futures = new ArrayList<>(poolSize);
+         for (int i = 0; i < chunks.size(); i += batchSize) {
+             List<LevelChunk> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
+             Future<?> future = tickPool.submit(() -> {
+@@ -160,7 +160,7 @@ public class ParallelProcessor {
+         int poolSize = getPoolSize();
+         int chunkSize = (entities.size() + poolSize - 1) / poolSize;
+ 
+-        List<Future<?>> futures = new ArrayList<>();
++        List<Future<?>> futures = new ArrayList<>(poolSize);
+         for (int i = 0; i < entities.size(); i += chunkSize) {
+             List<Entity> chunk = entities.subList(i, Math.min(i + chunkSize, entities.size()));
+             Future<?> future = tickPool.submit(() -> {
+diff --git a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+index df4e13708aef638cc7427db744048c409991b26f..ecde00fae23393373f538208d99a440d7814eead 100644
+--- a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
++++ b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+@@ -39,12 +39,14 @@ public final class NearbyPlayers {
+     private final Long2ReferenceOpenHashMap<TrackedChunk> byChunk = new Long2ReferenceOpenHashMap<>();
+ 
+     // Leaf start - optimize nearby players - multi-slot cache
+-    private final TrackedChunk[] cacheValues = new TrackedChunk[8];
+-    private final long[] cacheKeys = new long[8];
++    private static final int CACHE_SIZE = 64;
++    private static final int CACHE_MASK = CACHE_SIZE - 1;
++    private final TrackedChunk[] cacheValues = new TrackedChunk[CACHE_SIZE];
++    private final long[] cacheKeys = new long[CACHE_SIZE];
+     { java.util.Arrays.fill(this.cacheKeys, Long.MAX_VALUE); }
+ 
+     private TrackedChunk getChunkInternal(long key) {
+-        int hash = (int) (key ^ (key >>> 32)) & 7;
++        int hash = (int) it.unimi.dsi.fastutil.HashCommon.mix(key) & CACHE_MASK;
+         if (this.cacheKeys[hash] == key) {
+             return this.cacheValues[hash];
+         }
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index f73333bf08cdce2638df05169632e7b126943300..f65c113fcf573729b8bd0309d300e3197136ff4e 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -586,7 +586,7 @@ public class ServerChunkCache extends ChunkSource {
+                     Util.shuffle(shuffled, this.level.random);
+                     chunkIterator = shuffled.iterator();
+                 }
+-                List<LevelChunk> chunksToTick = new java.util.ArrayList<>();
++                List<LevelChunk> chunksToTick = new java.util.ArrayList<>(this.tickingChunks.size());
+                 try {
+                 // Paper end - optimise chunk tick iteration
+                 while (chunkIterator.hasNext()) {

@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 10:55:47 -0400
+Subject: [PATCH] Optimize NearbyPlayers, MultithreadedTracker, and
+ PlayerDataStorage
+
+
+diff --git a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+index ecde00fae23393373f538208d99a440d7814eead..3ea860d2a451f9c8467d9c98431a67a57960032f 100644
+--- a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
++++ b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+@@ -45,15 +45,28 @@ public final class NearbyPlayers {
+     private final long[] cacheKeys = new long[CACHE_SIZE];
+     { java.util.Arrays.fill(this.cacheKeys, Long.MAX_VALUE); }
+ 
++    // Thread-local single-slot cache for very tight loops like NaturalSpawner
++    private static final ThreadLocal<LastNearbyPlayers> localCache = ThreadLocal.withInitial(LastNearbyPlayers::new);
++
++    private static final class LastNearbyPlayers {
++        long key = Long.MAX_VALUE;
++        TrackedChunk value;
++    }
++
+     private TrackedChunk getChunkInternal(long key) {
++        LastNearbyPlayers local = localCache.get();
++        if (local.key == key) return local.value;
++
+         int hash = (int) it.unimi.dsi.fastutil.HashCommon.mix(key) & CACHE_MASK;
+         if (this.cacheKeys[hash] == key) {
+-            return this.cacheValues[hash];
++            local.key = key;
++            return local.value = this.cacheValues[hash];
+         }
+         TrackedChunk value = this.byChunk.get(key);
+         this.cacheValues[hash] = value;
+         this.cacheKeys[hash] = key;
+-        return value;
++        local.key = key;
++        return local.value = value;
+     }
+     // Leaf end
+ 
+diff --git a/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java b/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+index ebc16a54e3ead5348a522be9c655400204aa8646..d41c29ba684e9e6ee6581530bd3c6da4870e87c8 100644
+--- a/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -33,22 +33,34 @@ public class PlayerDataStorage {
+         this.playerDir.mkdirs();
+     }
+ 
++    private static final java.util.concurrent.ExecutorService playerSaveExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(
++        new com.google.common.util.concurrent.ThreadFactoryBuilder().setNameFormat("petal-player-save-thread").setPriority(Thread.MIN_PRIORITY).build()
++    );
++
+     public void save(Player player) {
+         if (org.spigotmc.SpigotConfig.disablePlayerDataSaving) return; // Spigot
+         try {
+             CompoundTag nbttagcompound = player.saveWithoutId(new CompoundTag());
+-            Path path = this.playerDir.toPath();
+-            Path path1 = Files.createTempFile(path, player.getStringUUID() + "-", ".dat");
+-
+-            NbtIo.writeCompressed(nbttagcompound, path1);
+-            Path path2 = path.resolve(player.getStringUUID() + ".dat");
+-            Path path3 = path.resolve(player.getStringUUID() + ".dat_old");
+-
+-            Util.safeReplaceFile(path2, path1, path3);
++            String uuidString = player.getStringUUID();
++            String scoreboardName = player.getScoreboardName();
++            
++            playerSaveExecutor.execute(() -> {
++                try {
++                    Path path = this.playerDir.toPath();
++                    Path tempPath = Files.createTempFile(path, uuidString + "-", ".dat");
++
++                    NbtIo.writeCompressed(nbttagcompound, tempPath);
++                    Path finalPath = path.resolve(uuidString + ".dat");
++                    Path oldPath = path.resolve(uuidString + ".dat_old");
++
++                    Util.safeReplaceFile(finalPath, tempPath, oldPath);
++                } catch (Exception exception) {
++                    PlayerDataStorage.LOGGER.warn("Failed to save player data asynchronously for {}", scoreboardName, exception);
++                }
++            });
+         } catch (Exception exception) {
+-            PlayerDataStorage.LOGGER.warn("Failed to save player data for {}", player.getScoreboardName(), exception); // Paper - Print exception
++            PlayerDataStorage.LOGGER.warn("Failed to prepare player data for save for {}", player.getScoreboardName(), exception);
+         }
+-
+     }
+ 
+     private void backup(String name, String s1, String s) { // name, uuid, extension
+diff --git a/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java b/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
+index fe5b778020986e1c2828764c400d81ac0a85eb3b..13ae86d295f22ce0c373ae1246fc7cad8ff7662d 100644
+--- a/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
++++ b/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
+@@ -139,7 +139,6 @@ public class MultithreadedTracker {
+         final Entity[] rawEntities = entitySlices.entities.getRawData();
+         final ChunkMap chunkMap = chunk.level.chunkSource.chunkMap;
+ 
+-        synchronized (chunkMap.entityMap) {
+         for (Entity entity : rawEntities) {
+             if (entity != null) {
+                 ChunkMap.TrackedEntity entityTracker = chunkMap.entityMap.get(entity.getId());
+@@ -152,7 +151,6 @@ public class MultithreadedTracker {
+                 }
+             }
+         }
+-        }
+     }
+ 
+ }
+\ No newline at end of file

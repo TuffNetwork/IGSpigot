@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 09:29:57 -0400
+Subject: [PATCH] Synchronize LevelTicks and LevelChunkTicks to prevent race
+ conditions with Slimefun
+
+
+diff --git a/src/main/java/net/minecraft/world/ticks/LevelChunkTicks.java b/src/main/java/net/minecraft/world/ticks/LevelChunkTicks.java
+index 2cdd18f724296f10cd4a522d1e8196723d39cf45..0422a64c95cac66d7a58eb38233cff264f95f34c 100644
+--- a/src/main/java/net/minecraft/world/ticks/LevelChunkTicks.java
++++ b/src/main/java/net/minecraft/world/ticks/LevelChunkTicks.java
+@@ -55,12 +55,12 @@ public class LevelChunkTicks<T> implements SerializableTickContainer<T>, TickCon
+     }
+ 
+     @Nullable
+-    public ScheduledTick<T> peek() {
++    public synchronized ScheduledTick<T> peek() {
+         return this.tickQueue.peek();
+     }
+ 
+     @Nullable
+-    public ScheduledTick<T> poll() {
++    public synchronized ScheduledTick<T> poll() {
+         ScheduledTick<T> scheduledTick = this.tickQueue.poll();
+         if (scheduledTick != null) {
+             this.dirty = true; // Paper - add dirty flag
+@@ -71,14 +71,14 @@ public class LevelChunkTicks<T> implements SerializableTickContainer<T>, TickCon
+     }
+ 
+     @Override
+-    public void schedule(ScheduledTick<T> orderedTick) {
++    public synchronized void schedule(ScheduledTick<T> orderedTick) {
+         if (this.ticksPerPosition.add(orderedTick)) {
+             this.dirty = true; // Paper - add dirty flag
+             this.scheduleUnchecked(orderedTick);
+         }
+     }
+ 
+-    private void scheduleUnchecked(ScheduledTick<T> orderedTick) {
++    private synchronized void scheduleUnchecked(ScheduledTick<T> orderedTick) {
+         this.tickQueue.add(orderedTick);
+         if (this.onTickAdded != null) {
+             this.onTickAdded.accept(this, orderedTick);
+@@ -86,7 +86,7 @@ public class LevelChunkTicks<T> implements SerializableTickContainer<T>, TickCon
+     }
+ 
+     @Override
+-    public boolean hasScheduledTick(BlockPos pos, T type) {
++    public synchronized boolean hasScheduledTick(BlockPos pos, T type) {
+         return this.ticksPerPosition.contains(ScheduledTick.probe(type, pos));
+     }
+ 
+diff --git a/src/main/java/net/minecraft/world/ticks/LevelTicks.java b/src/main/java/net/minecraft/world/ticks/LevelTicks.java
+index 6e24b2c1b9ac9f1be02a6cc88085cbbcbfee1a02..8ce0b3e37dd945a89f1c361c7dd2814150fdad04 100644
+--- a/src/main/java/net/minecraft/world/ticks/LevelTicks.java
++++ b/src/main/java/net/minecraft/world/ticks/LevelTicks.java
+@@ -46,7 +46,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         this.tickCheck = tickingFutureReadyPredicate;
+     }
+ 
+-    public void addContainer(ChunkPos pos, LevelChunkTicks<T> scheduler) {
++    public synchronized void addContainer(ChunkPos pos, LevelChunkTicks<T> scheduler) {
+         long l = pos.toLong();
+         this.allContainers.put(l, scheduler);
+         ScheduledTick<T> scheduledTick = scheduler.peek();
+@@ -57,7 +57,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         scheduler.setOnTickAdded(this.chunkScheduleUpdater);
+     }
+ 
+-    public void removeContainer(ChunkPos pos) {
++    public synchronized void removeContainer(ChunkPos pos) {
+         long l = pos.toLong();
+         LevelChunkTicks<T> levelChunkTicks = this.allContainers.remove(l);
+         this.nextTickForContainer.remove(l);
+@@ -67,7 +67,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     }
+ 
+     @Override
+-    public void schedule(ScheduledTick<T> orderedTick) {
++    public synchronized void schedule(ScheduledTick<T> orderedTick) {
+         long l = ChunkPos.asLong(orderedTick.pos());
+         LevelChunkTicks<T> levelChunkTicks = this.allContainers.get(l);
+         if (levelChunkTicks == null) {
+@@ -138,7 +138,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         }
+     }
+ 
+-    private void updateContainerScheduling(ScheduledTick<T> tick) {
++    private synchronized void updateContainerScheduling(ScheduledTick<T> tick) {
+         this.nextTickForContainer.put(ChunkPos.asLong(tick.pos()), tick.triggerTick());
+     }
+ 
+@@ -191,7 +191,7 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+     }
+ 
+     @Override
+-    public boolean hasScheduledTick(BlockPos pos, T type) {
++    public synchronized boolean hasScheduledTick(BlockPos pos, T type) {
+         LevelChunkTicks<T> levelChunkTicks = this.allContainers.get(ChunkPos.asLong(pos));
+         return levelChunkTicks != null && levelChunkTicks.hasScheduledTick(pos, type);
+     }

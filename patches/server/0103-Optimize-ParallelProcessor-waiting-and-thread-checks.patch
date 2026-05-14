@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 08:48:44 -0400
+Subject: [PATCH] Optimize ParallelProcessor waiting and thread checks
+
+
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+index 88337ad35b598646ad507d350a68035a8893e945..f87aac0b8de1b49d66305e1feab46845f4a26d1b 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
++++ b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+@@ -11,6 +11,7 @@ import net.minecraft.world.entity.projectile.Projectile;
+ import net.minecraft.world.entity.vehicle.AbstractMinecart;
+ import net.minecraft.world.entity.vehicle.Boat;
+ import net.minecraft.world.level.chunk.LevelChunk;
++import io.papermc.paper.util.TickThread;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+@@ -47,7 +48,7 @@ public class ParallelProcessor {
+     public static void setupThreadPool(int parallelism) {
+         isShuttingDown = false;
+         ThreadFactory threadFactory = runnable -> {
+-            Thread thread = new Thread(runnable,
++            TickThread thread = new TickThread(runnable,
+                     "Async-Tick-Pool-Thread-" + threadPoolID.getAndIncrement());
+             registerThread("Async-Tick", thread);
+             thread.setDaemon(false);
+@@ -75,9 +76,16 @@ public class ParallelProcessor {
+     }
+ 
+     private static boolean isThreadInPool(Thread thread) {
+-        return mcThreadTracker.getOrDefault("Async-Tick", Set.of()).stream()
+-                .map(WeakReference::get)
+-                .anyMatch(thread::equals);
++        // Fast path for our custom threads
++        if (thread instanceof TickThread) return true;
++
++        Set<WeakReference<Thread>> threads = mcThreadTracker.get("Async-Tick");
++        if (threads == null || threads.isEmpty()) return false;
++
++        for (WeakReference<Thread> ref : threads) {
++            if (thread.equals(ref.get())) return true;
++        }
++        return false;
+     }
+ 
+     public static boolean isServerExecutionThread() {
+@@ -117,14 +125,16 @@ public class ParallelProcessor {
+ 
+         boolean allDone;
+         do {
+-            allDone = futures.stream().allMatch(Future::isDone);
+-            if (!allDone) {
+-                boolean pumped = false;
+-                if (server != null) {
+-                    for (ServerLevel lvl : server.getAllLevels()) {
+-                        pumped |= lvl.getChunkSource().pollTask();
+-                    }
++            allDone = true;
++            for (int i = 0; i < futures.size(); i++) {
++                if (!futures.get(i).isDone()) {
++                    allDone = false;
++                    break;
+                 }
++            }
++
++            if (!allDone) {
++                boolean pumped = world.getChunkSource().pollTask();
+                 if (!pumped) {
+                     Thread.onSpinWait();
+                 }
+@@ -170,10 +180,16 @@ public class ParallelProcessor {
+ 
+         boolean allDone;
+         do {
+-            allDone = futures.stream().allMatch(Future::isDone);
++            allDone = true;
++            for (int i = 0; i < futures.size(); i++) {
++                if (!futures.get(i).isDone()) {
++                    allDone = false;
++                    break;
++                }
++            }
++
+             if (!allDone) {
+-                boolean pumped = false;
+-                pumped |= world.getChunkSource().pollTask();
++                boolean pumped = world.getChunkSource().pollTask();
+                 if (!pumped) {
+                     Thread.onSpinWait();
+                 }
