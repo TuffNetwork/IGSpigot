@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 17:12:15 -0400
+Subject: [PATCH] Fix NearbyPlayers thread-safety
+
+
+diff --git a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+index 3ea860d2a451f9c8467d9c98431a67a57960032f..7da6d481601e1a5a4b7e9d0c0d908ac4d7bc76fb 100644
+--- a/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
++++ b/src/main/java/io/papermc/paper/util/player/NearbyPlayers.java
+@@ -9,6 +9,7 @@ import net.minecraft.core.BlockPos;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.server.level.ServerPlayer;
+ import net.minecraft.world.level.ChunkPos;
++import java.util.concurrent.locks.ReentrantReadWriteLock; // Leaf
+ 
+ public final class NearbyPlayers {
+ 
+@@ -37,6 +38,7 @@ public final class NearbyPlayers {
+     private final ServerLevel world;
+     private final Reference2ReferenceOpenHashMap<ServerPlayer, TrackedPlayer[]> players = new Reference2ReferenceOpenHashMap<>();
+     private final Long2ReferenceOpenHashMap<TrackedChunk> byChunk = new Long2ReferenceOpenHashMap<>();
++    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock(); // Leaf - thread safety
+ 
+     // Leaf start - optimize nearby players - multi-slot cache
+     private static final int CACHE_SIZE = 64;
+@@ -57,16 +59,21 @@ public final class NearbyPlayers {
+         LastNearbyPlayers local = localCache.get();
+         if (local.key == key) return local.value;
+ 
+-        int hash = (int) it.unimi.dsi.fastutil.HashCommon.mix(key) & CACHE_MASK;
+-        if (this.cacheKeys[hash] == key) {
++        this.lock.readLock().lock();
++        try {
++            int hash = (int) it.unimi.dsi.fastutil.HashCommon.mix(key) & CACHE_MASK;
++            if (this.cacheKeys[hash] == key) {
++                local.key = key;
++                return local.value = this.cacheValues[hash];
++            }
++            TrackedChunk value = this.byChunk.get(key);
++            // We only update the local cache here to avoid write lock overhead for the shared cache
++            // The shared cache is updated in methods that already hold the write lock
+             local.key = key;
+-            return local.value = this.cacheValues[hash];
++            return local.value = value;
++        } finally {
++            this.lock.readLock().unlock();
+         }
+-        TrackedChunk value = this.byChunk.get(key);
+-        this.cacheValues[hash] = value;
+-        this.cacheKeys[hash] = key;
+-        local.key = key;
+-        return local.value = value;
+     }
+     // Leaf end
+ 
+@@ -75,34 +82,53 @@ public final class NearbyPlayers {
+     }
+ 
+     public void addPlayer(final ServerPlayer player) {
+-        final TrackedPlayer[] newTrackers = new TrackedPlayer[TOTAL_MAP_TYPES];
+-        if (this.players.putIfAbsent(player, newTrackers) != null) {
+-            throw new IllegalStateException("Already have player " + player);
+-        }
++        this.lock.writeLock().lock();
++        try {
++            final TrackedPlayer[] newTrackers = new TrackedPlayer[TOTAL_MAP_TYPES];
++            if (this.players.putIfAbsent(player, newTrackers) != null) {
++                throw new IllegalStateException("Already have player " + player);
++            }
+ 
+-        final ChunkPos chunk = player.chunkPosition();
++            final ChunkPos chunk = player.chunkPosition();
+ 
+-        for (int i = 0; i < TOTAL_MAP_TYPES; ++i) {
+-            // use 0 for default, will be updated by tickPlayer
+-            (newTrackers[i] = new TrackedPlayer(player, MOB_TYPES[i])).add(chunk.x, chunk.z, 0);
+-        }
++            for (int i = 0; i < TOTAL_MAP_TYPES; ++i) {
++                // use 0 for default, will be updated by tickPlayer
++                (newTrackers[i] = new TrackedPlayer(player, MOB_TYPES[i])).add(chunk.x, chunk.z, 0);
++            }
+ 
+-        // update view distances
+-        this.tickPlayer(player);
++            // update view distances
++            this.tickPlayerInternal(player);
++        } finally {
++            this.lock.writeLock().unlock();
++        }
+     }
+ 
+     public void removePlayer(final ServerPlayer player) {
+-        final TrackedPlayer[] players = this.players.remove(player);
+-        if (players == null) {
+-            return; // May be called during teleportation before the player is actually placed
+-        }
++        this.lock.writeLock().lock();
++        try {
++            final TrackedPlayer[] players = this.players.remove(player);
++            if (players == null) {
++                return; // May be called during teleportation before the player is actually placed
++            }
+ 
+-        for (final TrackedPlayer tracker : players) {
+-            tracker.remove();
++            for (final TrackedPlayer tracker : players) {
++                tracker.remove();
++            }
++        } finally {
++            this.lock.writeLock().unlock();
+         }
+     }
+ 
+     public void tickPlayer(final ServerPlayer player) {
++        this.lock.writeLock().lock();
++        try {
++            this.tickPlayerInternal(player);
++        } finally {
++            this.lock.writeLock().unlock();
++        }
++    }
++
++    private void tickPlayerInternal(final ServerPlayer player) {
+         final TrackedPlayer[] players = this.players.get(player);
+         if (players == null) {
+             throw new IllegalStateException("Don't have player " + player);
+@@ -129,33 +155,33 @@ public final class NearbyPlayers {
+     public ReferenceList<ServerPlayer> getPlayers(final BlockPos pos, final NearbyMapType type) {
+         final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(pos));
+ 
+-        return chunk == null ? null : chunk.players[type.ordinal()];
++        return chunk == null ? null : chunk.getPlayers(type); // Leaf - use getter
+     }
+ 
+     public ReferenceList<ServerPlayer> getPlayers(final ChunkPos pos, final NearbyMapType type) {
+         final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(pos));
+ 
+-        return chunk == null ? null : chunk.players[type.ordinal()];
++        return chunk == null ? null : chunk.getPlayers(type); // Leaf - use getter
+     }
+ 
+     // SparklyPaper start - cache coordinate key used for nearby players
+     public ReferenceList<ServerPlayer> getPlayers(final long nearbyPlayersCoordinateKey, final NearbyMapType type) {
+         final TrackedChunk chunk = this.getChunkInternal(nearbyPlayersCoordinateKey);
+ 
+-        return chunk == null ? null : chunk.players[type.ordinal()];
++        return chunk == null ? null : chunk.getPlayers(type); // Leaf - use getter
+     }
+     // SparklyPaper end
+ 
+     public ReferenceList<ServerPlayer> getPlayersByChunk(final int chunkX, final int chunkZ, final NearbyMapType type) {
+         final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+ 
+-        return chunk == null ? null : chunk.players[type.ordinal()];
++        return chunk == null ? null : chunk.getPlayers(type); // Leaf - use getter
+     }
+ 
+     public ReferenceList<ServerPlayer> getPlayersByBlock(final int blockX, final int blockZ, final NearbyMapType type) {
+         final TrackedChunk chunk = this.getChunkInternal(CoordinateUtils.getChunkKey(blockX >> 4, blockZ >> 4));
+ 
+-        return chunk == null ? null : chunk.players[type.ordinal()];
++        return chunk == null ? null : chunk.getPlayers(type); // Leaf - use getter
+     }
+ 
+     public static final class TrackedChunk {
+@@ -223,16 +249,22 @@ public final class NearbyPlayers {
+         protected void addCallback(final ServerPlayer parameter, final int chunkX, final int chunkZ) {
+             final long chunkKey = CoordinateUtils.getChunkKey(chunkX, chunkZ);
+ 
+-            NearbyPlayers.this.byChunk.computeIfAbsent(chunkKey, (final long keyInMap) -> {
++            TrackedChunk chunk = NearbyPlayers.this.byChunk.computeIfAbsent(chunkKey, (final long keyInMap) -> {
+                 return new TrackedChunk();
+-            }).addPlayer(parameter, this.type);
++            });
++            chunk.addPlayer(parameter, this.type);
++            
++            // Update shared cache since we already hold the write lock
++            int hash = (int) it.unimi.dsi.fastutil.HashCommon.mix(chunkKey) & CACHE_MASK;
++            NearbyPlayers.this.cacheKeys[hash] = chunkKey;
++            NearbyPlayers.this.cacheValues[hash] = chunk;
+         }
+ 
+         @Override
+         protected void removeCallback(final ServerPlayer parameter, final int chunkX, final int chunkZ) {
+             final long chunkKey = CoordinateUtils.getChunkKey(chunkX, chunkZ);
+ 
+-            final TrackedChunk chunk = NearbyPlayers.this.getChunkInternal(chunkKey);
++            final TrackedChunk chunk = NearbyPlayers.this.byChunk.get(chunkKey); // Don't use getChunkInternal here, we already hold the lock
+             if (chunk == null) {
+                 throw new IllegalStateException("Chunk should exist at " + new ChunkPos(chunkKey));
+             }
+@@ -241,8 +273,11 @@ public final class NearbyPlayers {
+ 
+             if (chunk.isEmpty()) {
+                 NearbyPlayers.this.byChunk.remove(chunkKey);
+-                int hash = (int) (chunkKey ^ (chunkKey >>> 32)) & 7;
+-                if (NearbyPlayers.this.cacheKeys[hash] == chunkKey) NearbyPlayers.this.cacheKeys[hash] = Long.MAX_VALUE;
++                int hash = (int) it.unimi.dsi.fastutil.HashCommon.mix(chunkKey) & CACHE_MASK;
++                if (NearbyPlayers.this.cacheKeys[hash] == chunkKey) {
++                    NearbyPlayers.this.cacheKeys[hash] = Long.MAX_VALUE;
++                    NearbyPlayers.this.cacheValues[hash] = null;
++                }
+             }
+         }
+     }
