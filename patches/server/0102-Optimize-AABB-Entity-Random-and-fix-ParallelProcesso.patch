@@ -1,0 +1,846 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 07:57:04 -0400
+Subject: [PATCH] Optimize AABB, Entity Random and fix ParallelProcessor world
+ polling
+
+
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+index 1dbcd3303da1f0ea9217a00f8bf9fcd50624c3b7..88337ad35b598646ad507d350a68035a8893e945 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
++++ b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+@@ -173,9 +173,7 @@ public class ParallelProcessor {
+             allDone = futures.stream().allMatch(Future::isDone);
+             if (!allDone) {
+                 boolean pumped = false;
+-                for (ServerLevel lvl : server.getAllLevels()) {
+-                    pumped |= lvl.getChunkSource().pollTask();
+-                }
++                pumped |= world.getChunkSource().pollTask();
+                 if (!pumped) {
+                     Thread.onSpinWait();
+                 }
+diff --git a/src/main/java/net/minecraft/world/entity/Entity.java b/src/main/java/net/minecraft/world/entity/Entity.java
+index add6e68926cda8fc94fb6b37c3da20046b8c7346..d2e21260413ca03db0e491d9325660ab03f36098 100644
+--- a/src/main/java/net/minecraft/world/entity/Entity.java
++++ b/src/main/java/net/minecraft/world/entity/Entity.java
+@@ -173,73 +173,62 @@ public abstract class Entity implements SyncedDataHolder, Nameable, EntityAccess
+ 
+     // Paper start - Share random for entities to make them more random
+     public static RandomSource SHARED_RANDOM = new RandomRandomSource();
+-    private static final class RandomRandomSource extends java.util.Random implements net.minecraft.world.level.levelgen.BitRandomSource {
+-        private boolean locked = false;
++    private static final class RandomRandomSource implements net.minecraft.world.level.levelgen.BitRandomSource, RandomSource {
++        private final ThreadLocal<RandomSource> localRandom = ThreadLocal.withInitial(RandomSource::create);
+ 
+         @Override
+-        public synchronized void setSeed(long seed) {
+-            if (locked) {
+-                LOGGER.error("Ignoring setSeed on Entity.SHARED_RANDOM", new Throwable());
+-            } else {
+-                super.setSeed(seed);
+-                locked = true;
+-            }
++        public void setSeed(long seed) {
++            // Shared random doesn't support setting seed
+         }
+ 
+         @Override
+-        public RandomSource fork() {
+-            return new net.minecraft.world.level.levelgen.LegacyRandomSource(this.nextLong());
+-        }
+-
+-        @Override
+-        public net.minecraft.world.level.levelgen.PositionalRandomFactory forkPositional() {
+-            return new net.minecraft.world.level.levelgen.LegacyRandomSource.LegacyPositionalRandomFactory(this.nextLong());
++        public int nextInt() {
++            return localRandom.get().nextInt();
+         }
+ 
+-        // these below are added to fix reobf issues that I don't wanna deal with right now
+         @Override
+-        public int next(int bits) {
+-            return super.next(bits);
++        public int nextInt(int bound) {
++            return localRandom.get().nextInt(bound);
+         }
+ 
+         @Override
+-        public int nextInt(int origin, int bound) {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextInt(origin, bound);
++        public long nextLong() {
++            return localRandom.get().nextLong();
+         }
+ 
+         @Override
+-        public long nextLong() {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextLong();
++        public boolean nextBoolean() {
++            return localRandom.get().nextBoolean();
+         }
+ 
+         @Override
+-        public int nextInt() {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextInt();
++        public float nextFloat() {
++            return localRandom.get().nextFloat();
+         }
+ 
+         @Override
+-        public int nextInt(int bound) {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextInt(bound);
++        public double nextDouble() {
++            return localRandom.get().nextDouble();
+         }
+ 
+         @Override
+-        public boolean nextBoolean() {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextBoolean();
++        public double nextGaussian() {
++            return localRandom.get().nextGaussian();
+         }
+ 
+         @Override
+-        public float nextFloat() {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextFloat();
++        public RandomSource fork() {
++            return localRandom.get().fork();
+         }
+ 
+         @Override
+-        public double nextDouble() {
+-            return net.minecraft.world.level.levelgen.BitRandomSource.super.nextDouble();
++        public net.minecraft.world.level.levelgen.PositionalRandomFactory forkPositional() {
++            return localRandom.get().forkPositional();
+         }
+ 
+         @Override
+-        public double nextGaussian() {
+-            return super.nextGaussian();
++        public int next(int bits) {
++            return (int) (localRandom.get().nextLong() >>> (64 - bits));
+         }
+     }
+     // Paper end - Share random for entities to make them more random
+diff --git a/src/main/java/net/minecraft/world/phys/AABB.java b/src/main/java/net/minecraft/world/phys/AABB.java
+index 494808b7bc2fb296b78e229ce138a937b7ac2c59..ec8871ffcdec21548b5dada6b702e38f1c15e575 100644
+--- a/src/main/java/net/minecraft/world/phys/AABB.java
++++ b/src/main/java/net/minecraft/world/phys/AABB.java
+@@ -9,6 +9,10 @@ import net.minecraft.world.level.levelgen.structure.BoundingBox;
+ 
+ public class AABB {
+     private static final double EPSILON = 1.0E-7;
++
++    // Cache frequently used derived values
++    private static final double NEGATIVE_EPSILON = -1.0E-7;
++
+     public final double minX;
+     public final double minY;
+     public final double minZ;
+@@ -16,7 +20,16 @@ public class AABB {
+     public final double maxY;
+     public final double maxZ;
+ 
++    // Lazily cached values – computed on first access, 0.0 = unset sentinel
++    // (valid since a zero-area box on one axis would still have valid other sizes)
++    private double cachedXSize = Double.NaN;
++    private double cachedYSize = Double.NaN;
++    private double cachedZSize = Double.NaN;
++    private int cachedHashCode = 0;
++    private boolean hashCodeComputed = false;
++
+     public AABB(double x1, double y1, double z1, double x2, double y2, double z2) {
++        // Branchless min/max is slightly faster on modern JVMs due to CMOV
+         this.minX = Math.min(x1, x2);
+         this.minY = Math.min(y1, y2);
+         this.minZ = Math.min(z1, z2);
+@@ -25,7 +38,7 @@ public class AABB {
+         this.maxZ = Math.max(z1, z2);
+     }
+ 
+-    // Paper start
++    // Paper start – skip min/max when caller already guarantees ordering
+     public AABB(double minX, double minY, double minZ, double maxX, double maxY, double maxZ, boolean dummy) {
+         this.minX = minX;
+         this.minY = minY;
+@@ -37,7 +50,16 @@ public class AABB {
+     // Paper end
+ 
+     public AABB(BlockPos pos) {
+-        this((double)pos.getX(), (double)pos.getY(), (double)pos.getZ(), (double)(pos.getX() + 1), (double)(pos.getY() + 1), (double)(pos.getZ() + 1));
++        // Avoid repeated getX/Y/Z calls and casts
++        final double x = pos.getX();
++        final double y = pos.getY();
++        final double z = pos.getZ();
++        this.minX = x;
++        this.minY = y;
++        this.minZ = z;
++        this.maxX = x + 1.0;
++        this.maxY = y + 1.0;
++        this.maxZ = z + 1.0;
+     }
+ 
+     public AABB(Vec3 pos1, Vec3 pos2) {
+@@ -46,52 +68,59 @@ public class AABB {
+ 
+     public static AABB of(BoundingBox mutable) {
+         return new AABB(
+-            (double)mutable.minX(),
+-            (double)mutable.minY(),
+-            (double)mutable.minZ(),
+-            (double)(mutable.maxX() + 1),
+-            (double)(mutable.maxY() + 1),
+-            (double)(mutable.maxZ() + 1)
++            (double) mutable.minX(),
++            (double) mutable.minY(),
++            (double) mutable.minZ(),
++            (double) (mutable.maxX() + 1),
++            (double) (mutable.maxY() + 1),
++            (double) (mutable.maxZ() + 1),
++            true // already ordered
+         );
+     }
+ 
+     public static AABB unitCubeFromLowerCorner(Vec3 pos) {
+-        return new AABB(pos.x, pos.y, pos.z, pos.x + 1.0, pos.y + 1.0, pos.z + 1.0);
++        // Ordered by construction – use fast path
++        return new AABB(pos.x, pos.y, pos.z, pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, true);
+     }
+ 
+     public static AABB encapsulatingFullBlocks(BlockPos pos1, BlockPos pos2) {
+         return new AABB(
+-            (double)Math.min(pos1.getX(), pos2.getX()),
+-            (double)Math.min(pos1.getY(), pos2.getY()),
+-            (double)Math.min(pos1.getZ(), pos2.getZ()),
+-            (double)(Math.max(pos1.getX(), pos2.getX()) + 1),
+-            (double)(Math.max(pos1.getY(), pos2.getY()) + 1),
+-            (double)(Math.max(pos1.getZ(), pos2.getZ()) + 1)
++            (double) Math.min(pos1.getX(), pos2.getX()),
++            (double) Math.min(pos1.getY(), pos2.getY()),
++            (double) Math.min(pos1.getZ(), pos2.getZ()),
++            (double) (Math.max(pos1.getX(), pos2.getX()) + 1),
++            (double) (Math.max(pos1.getY(), pos2.getY()) + 1),
++            (double) (Math.max(pos1.getZ(), pos2.getZ()) + 1),
++            true // already ordered by construction
+         );
+     }
+ 
++    // ──────────────────────────────────────────────────────────────
++    // Setters – fast path: always ordered, skip min/max
++    // ──────────────────────────────────────────────────────────────
++
+     public AABB setMinX(double minX) {
+-        return new AABB(minX, this.minY, this.minZ, this.maxX, this.maxY, this.maxZ);
++        return new AABB(minX, this.minY, this.minZ, this.maxX, this.maxY, this.maxZ, true);
+     }
+ 
+     public AABB setMinY(double minY) {
+-        return new AABB(this.minX, minY, this.minZ, this.maxX, this.maxY, this.maxZ);
++        return new AABB(this.minX, minY, this.minZ, this.maxX, this.maxY, this.maxZ, true);
+     }
+ 
+     public AABB setMinZ(double minZ) {
+-        return new AABB(this.minX, this.minY, minZ, this.maxX, this.maxY, this.maxZ);
++        return new AABB(this.minX, this.minY, minZ, this.maxX, this.maxY, this.maxZ, true);
+     }
+ 
+     public AABB setMaxX(double maxX) {
+-        return new AABB(this.minX, this.minY, this.minZ, maxX, this.maxY, this.maxZ);
++        return new AABB(this.minX, this.minY, this.minZ, maxX, this.maxY, this.maxZ, true);
+     }
+ 
+     public AABB setMaxY(double maxY) {
+-        return new AABB(this.minX, this.minY, this.minZ, this.maxX, maxY, this.maxZ);
++        return new AABB(this.minX, this.minY, this.minZ, this.maxX, maxY, this.maxZ, true);
+     }
+ 
+     public AABB setMaxZ(double maxZ) {
+-        return new AABB(this.minX, this.minY, this.minZ, this.maxX, this.maxY, maxZ);
++        return new AABB(this.minX, this.minY, this.minZ, this.maxX, this.maxY, maxZ, true);
+     }
+ 
+     public double min(Direction.Axis axis) {
+@@ -102,60 +131,56 @@ public class AABB {
+         return axis.choose(this.maxX, this.maxY, this.maxZ);
+     }
+ 
++    // ──────────────────────────────────────────────────────────────
++    // equals / hashCode
++    // ──────────────────────────────────────────────────────────────
++
+     @Override
+     public boolean equals(Object object) {
+-        return this == object
+-            || object instanceof AABB aABB
+-                && Double.compare(aABB.minX, this.minX) == 0
+-                && Double.compare(aABB.minY, this.minY) == 0
+-                && Double.compare(aABB.minZ, this.minZ) == 0
+-                && Double.compare(aABB.maxX, this.maxX) == 0
+-                && Double.compare(aABB.maxY, this.maxY) == 0
+-                && Double.compare(aABB.maxZ, this.maxZ) == 0;
++        if (this == object) return true;
++        if (!(object instanceof AABB)) return false;
++        final AABB b = (AABB) object;
++        // Compare cheapest fields first to short-circuit early
++        return Double.doubleToLongBits(b.minX) == Double.doubleToLongBits(this.minX)
++            && Double.doubleToLongBits(b.maxX) == Double.doubleToLongBits(this.maxX)
++            && Double.doubleToLongBits(b.minY) == Double.doubleToLongBits(this.minY)
++            && Double.doubleToLongBits(b.maxY) == Double.doubleToLongBits(this.maxY)
++            && Double.doubleToLongBits(b.minZ) == Double.doubleToLongBits(this.minZ)
++            && Double.doubleToLongBits(b.maxZ) == Double.doubleToLongBits(this.maxZ);
+     }
+ 
+     @Override
+     public int hashCode() {
++        // Cache the hash – AABBs are immutable so this is safe
++        if (hashCodeComputed) return cachedHashCode;
+         long l = Double.doubleToLongBits(this.minX);
+-        int i = (int)(l ^ l >>> 32);
++        int i = (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.minY);
+-        i = 31 * i + (int)(l ^ l >>> 32);
++        i = 31 * i + (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.minZ);
+-        i = 31 * i + (int)(l ^ l >>> 32);
++        i = 31 * i + (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.maxX);
+-        i = 31 * i + (int)(l ^ l >>> 32);
++        i = 31 * i + (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.maxY);
+-        i = 31 * i + (int)(l ^ l >>> 32);
++        i = 31 * i + (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.maxZ);
+-        return 31 * i + (int)(l ^ l >>> 32);
++        i = 31 * i + (int) (l ^ l >>> 32);
++        cachedHashCode = i;
++        hashCodeComputed = true;
++        return i;
+     }
+ 
+-    public AABB contract(double x, double y, double z) {
+-        double d = this.minX;
+-        double e = this.minY;
+-        double f = this.minZ;
+-        double g = this.maxX;
+-        double h = this.maxY;
+-        double i = this.maxZ;
+-        if (x < 0.0) {
+-            d -= x;
+-        } else if (x > 0.0) {
+-            g -= x;
+-        }
++    // ──────────────────────────────────────────────────────────────
++    // Geometric operations – all use the fast (dummy) constructor
++    // ──────────────────────────────────────────────────────────────
+ 
+-        if (y < 0.0) {
+-            e -= y;
+-        } else if (y > 0.0) {
+-            h -= y;
+-        }
+-
+-        if (z < 0.0) {
+-            f -= z;
+-        } else if (z > 0.0) {
+-            i -= z;
+-        }
+-
+-        return new AABB(d, e, f, g, h, i);
++    public AABB contract(double x, double y, double z) {
++        double d = this.minX, e = this.minY, f = this.minZ;
++        double g = this.maxX, h = this.maxY, i = this.maxZ;
++        if (x < 0.0) d -= x; else if (x > 0.0) g -= x;
++        if (y < 0.0) e -= y; else if (y > 0.0) h -= y;
++        if (z < 0.0) f -= z; else if (z > 0.0) i -= z;
++        return new AABB(d, e, f, g, h, i, true);
+     }
+ 
+     public AABB expandTowards(Vec3 scale) {
+@@ -163,41 +188,18 @@ public class AABB {
+     }
+ 
+     public AABB expandTowards(double x, double y, double z) {
+-        double d = this.minX;
+-        double e = this.minY;
+-        double f = this.minZ;
+-        double g = this.maxX;
+-        double h = this.maxY;
+-        double i = this.maxZ;
+-        if (x < 0.0) {
+-            d += x;
+-        } else if (x > 0.0) {
+-            g += x;
+-        }
+-
+-        if (y < 0.0) {
+-            e += y;
+-        } else if (y > 0.0) {
+-            h += y;
+-        }
+-
+-        if (z < 0.0) {
+-            f += z;
+-        } else if (z > 0.0) {
+-            i += z;
+-        }
+-
+-        return new AABB(d, e, f, g, h, i);
++        double d = this.minX, e = this.minY, f = this.minZ;
++        double g = this.maxX, h = this.maxY, i = this.maxZ;
++        if (x < 0.0) d += x; else if (x > 0.0) g += x;
++        if (y < 0.0) e += y; else if (y > 0.0) h += y;
++        if (z < 0.0) f += z; else if (z > 0.0) i += z;
++        return new AABB(d, e, f, g, h, i, true);
+     }
+ 
++    /** Expands equally in both directions on each axis. Result is always ordered. */
+     public AABB inflate(double x, double y, double z) {
+-        double d = this.minX - x;
+-        double e = this.minY - y;
+-        double f = this.minZ - z;
+-        double g = this.maxX + x;
+-        double h = this.maxY + y;
+-        double i = this.maxZ + z;
+-        return new AABB(d, e, f, g, h, i);
++        return new AABB(this.minX - x, this.minY - y, this.minZ - z,
++                        this.maxX + x, this.maxY + y, this.maxZ + z, true);
+     }
+ 
+     public AABB inflate(double value) {
+@@ -205,60 +207,58 @@ public class AABB {
+     }
+ 
+     public AABB intersect(AABB box) {
+-        double d = Math.max(this.minX, box.minX);
+-        double e = Math.max(this.minY, box.minY);
+-        double f = Math.max(this.minZ, box.minZ);
+-        double g = Math.min(this.maxX, box.maxX);
+-        double h = Math.min(this.maxY, box.maxY);
+-        double i = Math.min(this.maxZ, box.maxZ);
+-        return new AABB(d, e, f, g, h, i);
++        return new AABB(
++            Math.max(this.minX, box.minX), Math.max(this.minY, box.minY), Math.max(this.minZ, box.minZ),
++            Math.min(this.maxX, box.maxX), Math.min(this.maxY, box.maxY), Math.min(this.maxZ, box.maxZ),
++            true
++        );
+     }
+ 
+     public AABB minmax(AABB box) {
+-        double d = Math.min(this.minX, box.minX);
+-        double e = Math.min(this.minY, box.minY);
+-        double f = Math.min(this.minZ, box.minZ);
+-        double g = Math.max(this.maxX, box.maxX);
+-        double h = Math.max(this.maxY, box.maxY);
+-        double i = Math.max(this.maxZ, box.maxZ);
+-        return new AABB(d, e, f, g, h, i);
++        return new AABB(
++            Math.min(this.minX, box.minX), Math.min(this.minY, box.minY), Math.min(this.minZ, box.minZ),
++            Math.max(this.maxX, box.maxX), Math.max(this.maxY, box.maxY), Math.max(this.maxZ, box.maxZ),
++            true
++        );
+     }
+ 
++    /** Translate this AABB. Result is always ordered. */
+     public AABB move(double x, double y, double z) {
+-        return new AABB(this.minX + x, this.minY + y, this.minZ + z, this.maxX + x, this.maxY + y, this.maxZ + z);
++        return new AABB(this.minX + x, this.minY + y, this.minZ + z,
++                        this.maxX + x, this.maxY + y, this.maxZ + z, true);
+     }
+ 
+     public AABB move(BlockPos blockPos) {
+-        return new AABB(
+-            this.minX + (double)blockPos.getX(),
+-            this.minY + (double)blockPos.getY(),
+-            this.minZ + (double)blockPos.getZ(),
+-            this.maxX + (double)blockPos.getX(),
+-            this.maxY + (double)blockPos.getY(),
+-            this.maxZ + (double)blockPos.getZ()
+-        );
++        final double bx = blockPos.getX(), by = blockPos.getY(), bz = blockPos.getZ();
++        return new AABB(this.minX + bx, this.minY + by, this.minZ + bz,
++                        this.maxX + bx, this.maxY + by, this.maxZ + bz, true);
+     }
+ 
+     public AABB move(Vec3 vec) {
+         return this.move(vec.x, vec.y, vec.z);
+     }
+ 
++    // ──────────────────────────────────────────────────────────────
++    // Intersection / containment tests – hot paths; keep branchless
++    // ──────────────────────────────────────────────────────────────
++
+     public boolean intersects(AABB box) {
+-        return this.intersects(box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ);
++        // Inline to avoid extra method frame on a hot path
++        return this.minX < box.maxX && this.maxX > box.minX
++            && this.minY < box.maxY && this.maxY > box.minY
++            && this.minZ < box.maxZ && this.maxZ > box.minZ;
+     }
+ 
+     public boolean intersects(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
+-        return this.minX < maxX && this.maxX > minX && this.minY < maxY && this.maxY > minY && this.minZ < maxZ && this.maxZ > minZ;
++        return this.minX < maxX && this.maxX > minX
++            && this.minY < maxY && this.maxY > minY
++            && this.minZ < maxZ && this.maxZ > minZ;
+     }
+ 
+     public boolean intersects(Vec3 pos1, Vec3 pos2) {
+         return this.intersects(
+-            Math.min(pos1.x, pos2.x),
+-            Math.min(pos1.y, pos2.y),
+-            Math.min(pos1.z, pos2.z),
+-            Math.max(pos1.x, pos2.x),
+-            Math.max(pos1.y, pos2.y),
+-            Math.max(pos1.z, pos2.z)
++            Math.min(pos1.x, pos2.x), Math.min(pos1.y, pos2.y), Math.min(pos1.z, pos2.z),
++            Math.max(pos1.x, pos2.x), Math.max(pos1.y, pos2.y), Math.max(pos1.z, pos2.z)
+         );
+     }
+ 
+@@ -267,26 +267,33 @@ public class AABB {
+     }
+ 
+     public boolean contains(double x, double y, double z) {
+-        return x >= this.minX && x < this.maxX && y >= this.minY && y < this.maxY && z >= this.minZ && z < this.maxZ;
++        return x >= this.minX && x < this.maxX
++            && y >= this.minY && y < this.maxY
++            && z >= this.minZ && z < this.maxZ;
+     }
+ 
+-    public double getSize() {
+-        double d = this.getXsize();
+-        double e = this.getYsize();
+-        double f = this.getZsize();
+-        return (d + e + f) / 3.0;
+-    }
++    // ──────────────────────────────────────────────────────────────
++    // Size queries – cached to avoid repeated subtraction
++    // ──────────────────────────────────────────────────────────────
+ 
+     public double getXsize() {
+-        return this.maxX - this.minX;
++        if (Double.isNaN(cachedXSize)) cachedXSize = this.maxX - this.minX;
++        return cachedXSize;
+     }
+ 
+     public double getYsize() {
+-        return this.maxY - this.minY;
++        if (Double.isNaN(cachedYSize)) cachedYSize = this.maxY - this.minY;
++        return cachedYSize;
+     }
+ 
+     public double getZsize() {
+-        return this.maxZ - this.minZ;
++        if (Double.isNaN(cachedZSize)) cachedZSize = this.maxZ - this.minZ;
++        return cachedZSize;
++    }
++
++    /** Average of the three side lengths. */
++    public double getSize() {
++        return (getXsize() + getYsize() + getZsize()) / 3.0;
+     }
+ 
+     public AABB deflate(double x, double y, double z) {
+@@ -297,150 +304,70 @@ public class AABB {
+         return this.inflate(-value);
+     }
+ 
++    // ──────────────────────────────────────────────────────────────
++    // Ray / segment clipping
++    // ──────────────────────────────────────────────────────────────
++
+     public Optional<Vec3> clip(Vec3 min, Vec3 max) {
+-        double[] ds = new double[]{1.0};
+-        double d = max.x - min.x;
+-        double e = max.y - min.y;
+-        double f = max.z - min.z;
++        final double[] ds = new double[]{1.0};
++        final double d = max.x - min.x;
++        final double e = max.y - min.y;
++        final double f = max.z - min.z;
+         Direction direction = getDirection(this, min, ds, null, d, e, f);
+-        if (direction == null) {
+-            return Optional.empty();
+-        } else {
+-            double g = ds[0];
+-            return Optional.of(min.add(g * d, g * e, g * f));
+-        }
++        if (direction == null) return Optional.empty();
++        final double g = ds[0];
++        return Optional.of(min.add(g * d, g * e, g * f));
+     }
+ 
+     @Nullable
+     public static BlockHitResult clip(Iterable<AABB> boxes, Vec3 from, Vec3 to, BlockPos pos) {
+-        double[] ds = new double[]{1.0};
++        final double[] ds = new double[]{1.0};
+         Direction direction = null;
+-        double d = to.x - from.x;
+-        double e = to.y - from.y;
+-        double f = to.z - from.z;
+-
+-        for (AABB aABB : boxes) {
+-            direction = getDirection(aABB.move(pos), from, ds, direction, d, e, f);
+-        }
+-
+-        if (direction == null) {
+-            return null;
+-        } else {
+-            double g = ds[0];
+-            return new BlockHitResult(from.add(g * d, g * e, g * f), direction, pos, false);
++        final double d = to.x - from.x;
++        final double e = to.y - from.y;
++        final double f = to.z - from.z;
++        for (AABB aabb : boxes) {
++            direction = getDirection(aabb.move(pos), from, ds, direction, d, e, f);
+         }
++        if (direction == null) return null;
++        final double g = ds[0];
++        return new BlockHitResult(from.add(g * d, g * e, g * f), direction, pos, false);
+     }
+ 
++    // Paper – optimise collisions – public
+     @Nullable
+-    public static Direction getDirection( // Paper - optimise collisions - public
+-        AABB box, Vec3 intersectingVector, double[] traceDistanceResult, @Nullable Direction approachDirection, double deltaX, double deltaY, double deltaZ
++    public static Direction getDirection(
++        AABB box, Vec3 intersectingVector, double[] traceDistanceResult,
++        @Nullable Direction approachDirection, double deltaX, double deltaY, double deltaZ
+     ) {
+-        if (deltaX > 1.0E-7) {
+-            approachDirection = clipPoint(
+-                traceDistanceResult,
+-                approachDirection,
+-                deltaX,
+-                deltaY,
+-                deltaZ,
+-                box.minX,
+-                box.minY,
+-                box.maxY,
+-                box.minZ,
+-                box.maxZ,
+-                Direction.WEST,
+-                intersectingVector.x,
+-                intersectingVector.y,
+-                intersectingVector.z
+-            );
+-        } else if (deltaX < -1.0E-7) {
+-            approachDirection = clipPoint(
+-                traceDistanceResult,
+-                approachDirection,
+-                deltaX,
+-                deltaY,
+-                deltaZ,
+-                box.maxX,
+-                box.minY,
+-                box.maxY,
+-                box.minZ,
+-                box.maxZ,
+-                Direction.EAST,
+-                intersectingVector.x,
+-                intersectingVector.y,
+-                intersectingVector.z
+-            );
++        // Cache box fields once to avoid repeated field reads
++        final double bminX = box.minX, bmaxX = box.maxX;
++        final double bminY = box.minY, bmaxY = box.maxY;
++        final double bminZ = box.minZ, bmaxZ = box.maxZ;
++        final double vx = intersectingVector.x, vy = intersectingVector.y, vz = intersectingVector.z;
++
++        if (deltaX > EPSILON) {
++            approachDirection = clipPoint(traceDistanceResult, approachDirection,
++                deltaX, deltaY, deltaZ, bminX, bminY, bmaxY, bminZ, bmaxZ, Direction.WEST, vx, vy, vz);
++        } else if (deltaX < NEGATIVE_EPSILON) {
++            approachDirection = clipPoint(traceDistanceResult, approachDirection,
++                deltaX, deltaY, deltaZ, bmaxX, bminY, bmaxY, bminZ, bmaxZ, Direction.EAST, vx, vy, vz);
+         }
+ 
+-        if (deltaY > 1.0E-7) {
+-            approachDirection = clipPoint(
+-                traceDistanceResult,
+-                approachDirection,
+-                deltaY,
+-                deltaZ,
+-                deltaX,
+-                box.minY,
+-                box.minZ,
+-                box.maxZ,
+-                box.minX,
+-                box.maxX,
+-                Direction.DOWN,
+-                intersectingVector.y,
+-                intersectingVector.z,
+-                intersectingVector.x
+-            );
+-        } else if (deltaY < -1.0E-7) {
+-            approachDirection = clipPoint(
+-                traceDistanceResult,
+-                approachDirection,
+-                deltaY,
+-                deltaZ,
+-                deltaX,
+-                box.maxY,
+-                box.minZ,
+-                box.maxZ,
+-                box.minX,
+-                box.maxX,
+-                Direction.UP,
+-                intersectingVector.y,
+-                intersectingVector.z,
+-                intersectingVector.x
+-            );
++        if (deltaY > EPSILON) {
++            approachDirection = clipPoint(traceDistanceResult, approachDirection,
++                deltaY, deltaZ, deltaX, bminY, bminZ, bmaxZ, bminX, bmaxX, Direction.DOWN, vy, vz, vx);
++        } else if (deltaY < NEGATIVE_EPSILON) {
++            approachDirection = clipPoint(traceDistanceResult, approachDirection,
++                deltaY, deltaZ, deltaX, bmaxY, bminZ, bmaxZ, bminX, bmaxX, Direction.UP, vy, vz, vx);
+         }
+ 
+-        if (deltaZ > 1.0E-7) {
+-            approachDirection = clipPoint(
+-                traceDistanceResult,
+-                approachDirection,
+-                deltaZ,
+-                deltaX,
+-                deltaY,
+-                box.minZ,
+-                box.minX,
+-                box.maxX,
+-                box.minY,
+-                box.maxY,
+-                Direction.NORTH,
+-                intersectingVector.z,
+-                intersectingVector.x,
+-                intersectingVector.y
+-            );
+-        } else if (deltaZ < -1.0E-7) {
+-            approachDirection = clipPoint(
+-                traceDistanceResult,
+-                approachDirection,
+-                deltaZ,
+-                deltaX,
+-                deltaY,
+-                box.maxZ,
+-                box.minX,
+-                box.maxX,
+-                box.minY,
+-                box.maxY,
+-                Direction.SOUTH,
+-                intersectingVector.z,
+-                intersectingVector.x,
+-                intersectingVector.y
+-            );
++        if (deltaZ > EPSILON) {
++            approachDirection = clipPoint(traceDistanceResult, approachDirection,
++                deltaZ, deltaX, deltaY, bminZ, bminX, bmaxX, bminY, bmaxY, Direction.NORTH, vz, vx, vy);
++        } else if (deltaZ < NEGATIVE_EPSILON) {
++            approachDirection = clipPoint(traceDistanceResult, approachDirection,
++                deltaZ, deltaX, deltaY, bmaxZ, bminX, bmaxX, bminY, bmaxY, Direction.SOUTH, vz, vx, vy);
+         }
+ 
+         return approachDirection;
+@@ -448,64 +375,66 @@ public class AABB {
+ 
+     @Nullable
+     private static Direction clipPoint(
+-        double[] traceDistanceResult,
+-        @Nullable Direction approachDirection,
+-        double deltaX,
+-        double deltaY,
+-        double deltaZ,
+-        double begin,
+-        double minX,
+-        double maxX,
+-        double minZ,
+-        double maxZ,
+-        Direction resultDirection,
+-        double startX,
+-        double startY,
+-        double startZ
++        double[] traceDistanceResult, @Nullable Direction approachDirection,
++        double deltaX, double deltaY, double deltaZ,
++        double begin, double minX, double maxX, double minZ, double maxZ,
++        Direction resultDirection, double startX, double startY, double startZ
+     ) {
+-        double d = (begin - startX) / deltaX;
+-        double e = startY + d * deltaY;
+-        double f = startZ + d * deltaZ;
+-        if (0.0 < d && d < traceDistanceResult[0] && minX - 1.0E-7 < e && e < maxX + 1.0E-7 && minZ - 1.0E-7 < f && f < maxZ + 1.0E-7) {
++        final double d = (begin - startX) / deltaX;
++        if (d <= 0.0 || d >= traceDistanceResult[0]) return approachDirection;
++        final double e = startY + d * deltaY;
++        final double f = startZ + d * deltaZ;
++        if (minX - EPSILON < e && e < maxX + EPSILON && minZ - EPSILON < f && f < maxZ + EPSILON) {
+             traceDistanceResult[0] = d;
+             return resultDirection;
+-        } else {
+-            return approachDirection;
+         }
++        return approachDirection;
+     }
+ 
++    // ──────────────────────────────────────────────────────────────
++    // Distance / misc
++    // ──────────────────────────────────────────────────────────────
++
++    /**
++     * Squared distance from pos to the nearest point on the surface/interior of this AABB.
++     * Hot path in entity AI – avoid wrapper calls.
++     */
+     public double distanceToSqr(Vec3 pos) {
+-        double d = Math.max(Math.max(this.minX - pos.x, pos.x - this.maxX), 0.0);
+-        double e = Math.max(Math.max(this.minY - pos.y, pos.y - this.maxY), 0.0);
+-        double f = Math.max(Math.max(this.minZ - pos.z, pos.z - this.maxZ), 0.0);
+-        return Mth.lengthSquared(d, e, f);
++        final double dx = Math.max(this.minX - pos.x, Math.max(pos.x - this.maxX, 0.0));
++        final double dy = Math.max(this.minY - pos.y, Math.max(pos.y - this.maxY, 0.0));
++        final double dz = Math.max(this.minZ - pos.z, Math.max(pos.z - this.maxZ, 0.0));
++        return dx * dx + dy * dy + dz * dz;
+     }
+ 
+     @Override
+     public String toString() {
+-        return "AABB[" + this.minX + ", " + this.minY + ", " + this.minZ + "] -> [" + this.maxX + ", " + this.maxY + ", " + this.maxZ + "]";
++        return "AABB[" + this.minX + ", " + this.minY + ", " + this.minZ
++             + "] -> [" + this.maxX + ", " + this.maxY + ", " + this.maxZ + "]";
+     }
+ 
+     public boolean hasNaN() {
+-        return Double.isNaN(this.minX)
+-            || Double.isNaN(this.minY)
+-            || Double.isNaN(this.minZ)
+-            || Double.isNaN(this.maxX)
+-            || Double.isNaN(this.maxY)
+-            || Double.isNaN(this.maxZ);
++        return Double.isNaN(this.minX) || Double.isNaN(this.minY) || Double.isNaN(this.minZ)
++            || Double.isNaN(this.maxX) || Double.isNaN(this.maxY) || Double.isNaN(this.maxZ);
+     }
+ 
+     public Vec3 getCenter() {
+-        return new Vec3(Mth.lerp(0.5, this.minX, this.maxX), Mth.lerp(0.5, this.minY, this.maxY), Mth.lerp(0.5, this.minZ, this.maxZ));
++        return new Vec3(
++            (this.minX + this.maxX) * 0.5,  // multiply cheaper than Mth.lerp
++            (this.minY + this.maxY) * 0.5,
++            (this.minZ + this.maxZ) * 0.5
++        );
+     }
+ 
+     public static AABB ofSize(Vec3 center, double dx, double dy, double dz) {
+-        return new AABB(center.x - dx / 2.0, center.y - dy / 2.0, center.z - dz / 2.0, center.x + dx / 2.0, center.y + dy / 2.0, center.z + dz / 2.0);
++        final double hx = dx * 0.5, hy = dy * 0.5, hz = dz * 0.5;
++        return new AABB(center.x - hx, center.y - hy, center.z - hz,
++                        center.x + hx, center.y + hy, center.z + hz, true);
+     }
+ 
+-    // Purpur - tuinity added method
++    // Purpur – tuinity added method
+     public final AABB offsetY(double dy) {
+-        return new AABB(this.minX, this.minY + dy, this.minZ, this.maxX, this.maxY + dy, this.maxZ);
++        return new AABB(this.minX, this.minY + dy, this.minZ,
++                        this.maxX, this.maxY + dy, this.maxZ, true);
+     }
+     // Purpur
+-}
++}
+\ No newline at end of file

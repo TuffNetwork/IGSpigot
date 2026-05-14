@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: octylphenol <272425610+octylphenol@users.noreply.github.com>
+Date: Thu, 14 May 2026 07:34:42 -0400
+Subject: [PATCH] Fix concurrency issues in entity ticking and tracking
+
+
+diff --git a/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java b/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java
+index 3fbf6eeb3e835269217a381f00b54a7ec43d5bd2..d9d7e6480ca40deb03284bf71a565dd9d2edff86 100644
+--- a/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java
++++ b/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java
+@@ -94,7 +94,7 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+         return 1.0 - ((double)this.indexMap.size() / (double)this.listSize);
+     }
+ 
+-    public int createRawIterator() {
++    public synchronized int createRawIterator() {
+         if (this.allowSafeIteration()) {
+             ++this.iteratorCount;
+         }
+@@ -117,15 +117,17 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+         return -1;
+     }
+ 
+-    public void finishRawIterator() {
+-        if (this.allowSafeIteration() && --this.iteratorCount == 0) {
+-            if (this.getFragFactor() >= this.maxFragFactor) {
+-                this.defrag();
++    public synchronized void finishRawIterator() {
++        if (this.allowSafeIteration()) {
++            if (--this.iteratorCount == 0) {
++                if (this.getFragFactor() >= this.maxFragFactor) {
++                    this.defrag();
++                }
+             }
+         }
+     }
+ 
+-    public boolean remove(final E element) {
++    public synchronized boolean remove(final E element) {
+         final int index = this.indexMap.removeInt(element);
+         if (index >= 0) {
+             if (this.firstInvalidIndex < 0 || index < this.firstInvalidIndex) {
+@@ -148,7 +150,7 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+         return this.indexMap.containsKey(element);
+     }
+ 
+-    public boolean add(final E element) {
++    public synchronized boolean add(final E element) {
+         final int listSize = this.listSize;
+ 
+         final int previous = this.indexMap.putIfAbsent(element, listSize);
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index 4c23012c07d91b804ed72bfa4ee953dfad7a7a96..888456e88a45d9536342c065a4f6c7ed0cac38fb 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -1080,6 +1080,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+     public void addEntity(Entity entity) {
+         org.spigotmc.AsyncCatcher.catchOp("entity track"); // Spigot
+         // Paper start - ignore and warn about illegal addEntity calls instead of crashing server
++        synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+         if (!entity.valid || entity.level() != this.level || this.entityMap.containsKey(entity.getId())) {
+             LOGGER.error("Illegal ChunkMap::addEntity for world " + this.level.getWorld().getName()
+                 + ": " + entity  + (this.entityMap.containsKey(entity.getId()) ? " ALREADY CONTAINED (This would have crashed your server)" : ""), new Throwable());
+@@ -1117,22 +1118,24 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+                             }
+                         }
+                     }
+-
+                 }
+             }
+         }
++        } // Leaf - end synchronize
+     }
+ 
+     protected void removeEntity(Entity entity) {
+         org.spigotmc.AsyncCatcher.catchOp("entity untrack"); // Spigot
++        synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+         if (entity instanceof ServerPlayer entityplayer) {
+             this.updatePlayerStatus(entityplayer, false);
+             ObjectIterator objectiterator = this.entityMap.values().iterator();
+ 
+             while (objectiterator.hasNext()) {
+                 ChunkMap.TrackedEntity playerchunkmap_entitytracker = (ChunkMap.TrackedEntity) objectiterator.next();
+-
+-                playerchunkmap_entitytracker.removePlayer(entityplayer);
++                if (playerchunkmap_entitytracker != null) { // Leaf - check for null
++                    playerchunkmap_entitytracker.removePlayer(entityplayer);
++                }
+             }
+         }
+ 
+@@ -1142,6 +1145,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             playerchunkmap_entitytracker1.broadcastRemoved();
+         }
+         entity.tracker = null; // Paper - We're no longer tracked
++        } // Leaf - end synchronize
+     }
+ 
+     // Leaf start - petal - multithreaded tracker
+@@ -1176,6 +1180,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+ 
+             if (net.minecraft.server.MinecraftServer.getServer().getPlayerList().players.isEmpty()) return; // Leaf - Don't update since the server is empty
+ 
++            synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+             for (TrackedEntity tracker : this.entityMap.values()) {
+                 // update tracker entry
+                 tracker.updatePlayers(tracker.entity.getPlayersInTrackRange());
+@@ -1184,6 +1189,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             for (TrackedEntity tracker : this.entityMap.values()) {
+                 tracker.serverEntity.sendChanges();
+             }
++            } // Leaf - end synchronize
+     }
+     // Paper end - optimised tracker
+ 
+@@ -1234,21 +1240,23 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+     }
+ 
+     public void broadcast(Entity entity, Packet<?> packet) {
++        synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+         ChunkMap.TrackedEntity playerchunkmap_entitytracker = (ChunkMap.TrackedEntity) this.entityMap.get(entity.getId());
+ 
+         if (playerchunkmap_entitytracker != null) {
+             playerchunkmap_entitytracker.broadcast(packet);
+         }
+-
++        } // Leaf - end synchronize
+     }
+ 
+     protected void broadcastAndSend(Entity entity, Packet<?> packet) {
++        synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+         ChunkMap.TrackedEntity playerchunkmap_entitytracker = (ChunkMap.TrackedEntity) this.entityMap.get(entity.getId());
+ 
+         if (playerchunkmap_entitytracker != null) {
+             playerchunkmap_entitytracker.broadcastAndSend(packet);
+         }
+-
++        } // Leaf - end synchronize
+     }
+ 
+     public void resendBiomesForChunks(List<ChunkAccess> chunks) {
+diff --git a/src/main/java/net/minecraft/world/level/entity/EntityTickList.java b/src/main/java/net/minecraft/world/level/entity/EntityTickList.java
+index 0c8c534fc69172387f188af5282accfed7597ac7..7ea02597c1ef81113b541374264755716543266f 100644
+--- a/src/main/java/net/minecraft/world/level/entity/EntityTickList.java
++++ b/src/main/java/net/minecraft/world/level/entity/EntityTickList.java
+@@ -15,13 +15,13 @@ public class EntityTickList {
+         // Paper - replace with better logic, do not delay removals
+     }
+ 
+-    public void add(Entity entity) {
++    public synchronized void add(Entity entity) {
+         io.papermc.paper.util.TickThread.ensureTickThread("Asynchronous entity ticklist addition"); // Paper
+         this.ensureActiveIsNotIterated();
+         this.entities.add(entity); // Paper - replace with better logic, do not delay removals/additions
+     }
+ 
+-    public void remove(Entity entity) {
++    public synchronized void remove(Entity entity) {
+         io.papermc.paper.util.TickThread.ensureTickThread("Asynchronous entity ticklist removal"); // Paper
+         this.ensureActiveIsNotIterated();
+         this.entities.remove(entity); // Paper - replace with better logic, do not delay removals/additions
+@@ -31,7 +31,7 @@ public class EntityTickList {
+         return this.entities.contains(entity); // Paper - replace with better logic, do not delay removals/additions
+     }
+ 
+-    public void forEach(Consumer<Entity> action) {
++    public synchronized void forEach(Consumer<Entity> action) {
+         io.papermc.paper.util.TickThread.ensureTickThread("Asynchronous entity ticklist iteration"); // Paper
+         // Paper start - replace with better logic, do not delay removals/additions
+         // To ensure nothing weird happens with dimension travelling, do not iterate over new entries...
+diff --git a/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java b/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
+index 13ae86d295f22ce0c373ae1246fc7cad8ff7662d..fe5b778020986e1c2828764c400d81ac0a85eb3b 100644
+--- a/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
++++ b/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
+@@ -139,6 +139,7 @@ public class MultithreadedTracker {
+         final Entity[] rawEntities = entitySlices.entities.getRawData();
+         final ChunkMap chunkMap = chunk.level.chunkSource.chunkMap;
+ 
++        synchronized (chunkMap.entityMap) {
+         for (Entity entity : rawEntities) {
+             if (entity != null) {
+                 ChunkMap.TrackedEntity entityTracker = chunkMap.entityMap.get(entity.getId());
+@@ -151,6 +152,7 @@ public class MultithreadedTracker {
+                 }
+             }
+         }
++        }
+     }
+ 
+ }
+\ No newline at end of file
