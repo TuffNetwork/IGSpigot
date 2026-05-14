@@ -8,10 +8,10 @@
 ## 🤣 USPIGOT DISS
 Y'all bums violating the GPL License 🤣🤣🤣
 
-## How does this compare to USpigot
+## 🚀 How does this compare to USpigot
 Idk man I think it does similar or just as good, maybe a bit better in some cases
 
-### TODO
+## 📄 TODO
 - [ ] Port C2ME
 - [ ] Multithreaded Chunk thing??
 - [ ] Fully rebrand to IGSpigot for larps
