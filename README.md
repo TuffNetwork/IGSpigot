@@ -6,8 +6,14 @@
 </div>
 
 ## 🤣 USPIGOT DISS
-Y'all bums violating the GPL License 🤣🤣🤣
 
+Y'all bums violating the GPL License 🤣🤣🤣
+uspigot devs so broke they're overpricing their slop 🤣
+igspigot makes more money than uspigot
+bunch of jobless bums charging money off free shit
+uspigot, more like, trahs 🤣🤣🤣🤣🤣🤣🤣
+
+=======
 ## How does this compare to USpigot
 Idk man I think it does similar or just as good, maybe a bit better in some cases
 
@@ -16,6 +22,7 @@ Idk man I think it does similar or just as good, maybe a bit better in some case
 - [ ] Multithreaded Chunk thing??
 - [ ] Fully rebrand to IGSpigot for larps
 - [ ] Add ai slop disclaimer
+>>>>>>> ver/1.20.6
 
 ## 📥 Download
 Compile it yourself
