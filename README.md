@@ -1,4 +1,4 @@
-<img src="https://media3.giphy.com/media/CP9JZLQkNwMHxkDZVi/giphy.gif" alt="Leaf">
+<img src="https://media3.giphy.com/media/CP9JZLQkNwMHxkDZVi/giphy.gif" alt="ai slop image just like this server software">
 <div align="center">
  
 
@@ -7,6 +7,15 @@
 
 ## 🤣 USPIGOT DISS
 Y'all bums violating the GPL License 🤣🤣🤣
+
+## How does this compare to USpigot
+Idk man I think it does similar or just as good, maybe a bit better in some cases
+
+### TODO
+- [ ] Port C2ME
+- [ ] Multithreaded Chunk thing??
+- [ ] Fully rebrand to IGSpigot for larps
+- [ ] Add ai slop disclaimer
 
 ## 📥 Download
 Compile it yourself
