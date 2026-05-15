@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cirsius <swagydorwhatever@gmail.com>
+Date: Fri, 15 May 2026 12:46:11 -0500
+Subject: [PATCH] Faster startup, TPS micro-opts, fix packetLock deadlock
+
+
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java b/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
+index 0846d3a904e470ae1920c5c8be3df9c5dfc3de27..8a1227b641e258a9209341e8e987df1892dba8d7 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
+@@ -27,16 +27,35 @@ public class DirectoryProviderSource implements ProviderSource<Path, List<Path>>
+             Files.createDirectories(context);
+         }
+ 
+-        final List<Path> files = new ArrayList<>();
+-        this.walkFiles(context, path -> {
++        // Leaf start - parallel plugin file preparation.
++        // Each prepareContext opens the JAR to read its plugin name and walks the update
++        // directory; on a server with ~70 plugins this is the dominant pre-bootstrap cost.
++        // We preserve the file ordering by writing into a fixed-size results array then
++        // filtering nulls, so the downstream load order is identical to the sequential path.
++        final List<Path> jarPaths;
++        try (java.util.stream.Stream<Path> stream = Files.walk(context, 1, FileVisitOption.FOLLOW_LINKS)) {
++            jarPaths = stream.filter(this::isValidFile).sorted().toList();
++        }
++        final Path[] results = new Path[jarPaths.size()];
++        final java.util.concurrent.ConcurrentLinkedQueue<Throwable> errors = new java.util.concurrent.ConcurrentLinkedQueue<>();
++        java.util.stream.IntStream.range(0, jarPaths.size()).parallel().forEach(i -> {
++            final Path path = jarPaths.get(i);
+             try {
+-                files.add(FILE_PROVIDER_SOURCE.prepareContext(path));
++                results[i] = FILE_PROVIDER_SOURCE.prepareContext(path);
+             } catch (IllegalArgumentException ignored) {
+                 // Ignore illegal argument exceptions from jar checking
+             } catch (final Exception e) {
+-                LOGGER.error("Error preparing plugin context: " + e.getMessage(), e);
++                errors.add(e);
+             }
+         });
++        for (Throwable t : errors) {
++            LOGGER.error("Error preparing plugin context: " + t.getMessage(), t);
++        }
++        final List<Path> files = new ArrayList<>(results.length);
++        for (Path p : results) {
++            if (p != null) files.add(p);
++        }
++        // Leaf end - parallel plugin file preparation
+         // Paper start - Remap plugins
+         if (io.papermc.paper.plugin.PluginInitializerManager.instance().pluginRemapper != null) {
+             return io.papermc.paper.plugin.PluginInitializerManager.instance().pluginRemapper.rewritePluginDirectory(files);
+diff --git a/src/main/java/net/minecraft/network/protocol/PacketUtils.java b/src/main/java/net/minecraft/network/protocol/PacketUtils.java
+index 3698bc741dcdb43e5fe8635108a8a8b566e24d9b..28bb756d3e7c5aac67eadf6b4edb7c928dabf223 100644
+--- a/src/main/java/net/minecraft/network/protocol/PacketUtils.java
++++ b/src/main/java/net/minecraft/network/protocol/PacketUtils.java
+@@ -43,21 +43,18 @@ public class PacketUtils {
+     );
+ 
+     private static boolean isAsyncSafe(Packet<?> packet) {
++        // Leaf - restricted to truly stateless packets. The previous list included movement,
++        // interact, client-command and teleport-accept packets which all read+write world state
++        // and frequently wait on chunk loads. Combined with the tick-wide packetLock that
++        // ServerGamePacketListenerImpl.tick() used to grab, that produced classic priority-
++        // inversion deadlocks: async handler held packetLock + waited on a chunk; main thread
++        // held nothing but was parked on packetLock and so could not pump the chunk task.
++        // Only network housekeeping packets stay async now.
+         String name = packet.getClass().getSimpleName();
+-        return name.contains("ServerboundClientInformationPacket") ||
+-               name.contains("ServerboundCustomPayloadPacket") ||
+-               name.contains("ServerboundKeepAlivePacket") ||
+-               name.contains("ServerboundPingRequestPacket") ||
+-               name.contains("ServerboundPongResponsePacket") ||
+-               name.contains("ServerboundResourcePackPacket") ||
+-               name.contains("ServerboundCookieResponsePacket") ||
+-               name.contains("ServerboundSeenAdvancementsPacket") ||
+-               name.contains("ServerboundMovePlayerPacket") ||
+-               name.contains("ServerboundPlayerInputPacket") ||
+-               name.contains("ServerboundSwingPacket") ||
+-               name.contains("ServerboundInteractPacket") ||
+-               name.contains("ServerboundClientCommandPacket") ||
+-               name.contains("ServerboundAcceptTeleportationPacket");
++        return name.equals("ServerboundKeepAlivePacket") ||
++               name.equals("ServerboundPingRequestPacket") ||
++               name.equals("ServerboundPongResponsePacket") ||
++               name.equals("ServerboundCookieResponsePacket");
+     }
+ 
+     public static boolean isAsyncThread() {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index dbb842a6f73e5936ead8d7bca0f8ce5a9a4c2934..90c63027edb817a236ffc0688a7e0c2c7d6eec32 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -888,8 +888,10 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+         if (!this.isDebug() && flag) {
+             j = this.getGameTime();
+-            this.blockTicks.tick(j, paperConfig().environment.maxBlockTicks, this::tickBlock); // Paper - configurable max block ticks
+-            this.fluidTicks.tick(j, paperConfig().environment.maxFluidTicks, this::tickFluid); // Paper - configurable max fluid ticks
++            // Leaf - one paperConfig() lookup instead of two
++            final io.papermc.paper.configuration.WorldConfiguration.Environment _env = paperConfig().environment;
++            this.blockTicks.tick(j, _env.maxBlockTicks, this::tickBlock); // Paper - configurable max block ticks
++            this.fluidTicks.tick(j, _env.maxFluidTicks, this::tickFluid); // Paper - configurable max fluid ticks
+         }
+ 
+         if (flag) {
+@@ -1020,15 +1022,18 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         int k = chunkcoordintpair.getMinBlockZ();
+         final BlockPos.MutableBlockPos blockposition = new BlockPos.MutableBlockPos();
+         final net.minecraft.util.RandomSource randomTickRandom = net.minecraft.util.RandomSource.createThreadSafe();
++        // Leaf - cache paperConfig() in hot loop (4 reads per tickChunk, called for every ticking chunk every tick)
++        final io.papermc.paper.configuration.WorldConfiguration paperConfig = this.paperConfig();
++        final io.papermc.paper.configuration.WorldConfiguration.Environment env = paperConfig.environment;
+ 
+-        if (!this.paperConfig().environment.disableThunder && flag && this.isThundering() && this.spigotConfig.thunderChance > 0 && /*this.random.nextInt(this.spigotConfig.thunderChance) == 0 &&*/ chunk.shouldDoLightning(randomTickRandom)) { // Spigot // Paper - Option to disable thunder // Gale - Airplane - optimize random calls in chunk ticking - replace random with shouldDoLightning
++        if (!env.disableThunder && flag && this.isThundering() && this.spigotConfig.thunderChance > 0 && /*this.random.nextInt(this.spigotConfig.thunderChance) == 0 &&*/ chunk.shouldDoLightning(randomTickRandom)) { // Spigot // Paper - Option to disable thunder // Gale - Airplane - optimize random calls in chunk ticking - replace random with shouldDoLightning
+             int i1 = randomTickRandom.nextInt();
+             blockposition.set(j + (i1 & 15), this.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, j + (i1 & 15), k + (i1 >> 8 & 15)), k + (i1 >> 8 & 15)); // Inline thread-safe getBlockRandomPos
+             blockposition.set(this.findLightningTargetAround(blockposition.immutable())); // Paper
+ 
+             if (this.isRainingAt(blockposition)) {
+                 DifficultyInstance difficultydamagescaler = this.getCurrentDifficultyAt(blockposition);
+-                boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && randomTickRandom.nextDouble() < (double) difficultydamagescaler.getEffectiveDifficulty() * this.paperConfig().entities.spawning.skeletonHorseThunderSpawnChance.or(0.01D) && !this.getBlockState(blockposition.below()).is(Blocks.LIGHTNING_ROD); // Paper - Configurable spawn chances for skeleton horses
++                boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && randomTickRandom.nextDouble() < (double) difficultydamagescaler.getEffectiveDifficulty() * paperConfig.entities.spawning.skeletonHorseThunderSpawnChance.or(0.01D) && !this.getBlockState(blockposition.below()).is(Blocks.LIGHTNING_ROD); // Paper - Configurable spawn chances for skeleton horses // Leaf - cached paperConfig
+ 
+                 if (flag1) {
+                     // Purpur start
+@@ -1059,7 +1064,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+         }
+ 
+-        if (!this.paperConfig().environment.disableIceAndSnow && (this.currentIceAndSnowTick.getAndIncrement() & 15) == 0) { // Paper - Option to disable ice and snow // Gale - Airplane - optimize random calls in chunk ticking - optimize further random ticking
++        if (!env.disableIceAndSnow && (this.currentIceAndSnowTick.getAndIncrement() & 15) == 0) { // Paper - Option to disable ice and snow // Gale - Airplane - optimize random calls in chunk ticking - optimize further random ticking // Leaf - cached env
+         for (int l = 0; l < randomTickSpeed; ++l) {
+             if (randomTickRandom.nextInt(48) == 0) {
+                 // Paper start
+diff --git a/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 22e22d78da7e3f7ed48cf78cf1f642d280a57218..03ab641fce37b1f076c6a9301d5ab8cfee62a6f3 100644
+--- a/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -353,8 +353,10 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+ 
+     @Override
+     public void tick() {
+-        this.packetLock.lock();
+-        try {
++        // Leaf - removed packetLock around tick(): with the async-safe packet list narrowed to
++        // stateless keep-alive/ping/cookie packets, no async handler touches mutable per-player
++        // state during the tick, so this lock is no longer needed and was a deadlock source
++        // (main thread parked on it while an async handler waited for a chunk load).
+         if (this.ackBlockChangesUpTo > -1) {
+             this.send(new ClientboundBlockChangedAckPacket(this.ackBlockChangesUpTo));
+             this.ackBlockChangesUpTo = -1;
+@@ -436,9 +438,6 @@ public class ServerGamePacketListenerImpl extends ServerCommonPacketListenerImpl
+             hasLoggedExpiry = true;
+         }
+         // Paper end - Prevent causing expired keys from impacting new joins
+-        } finally {
+-            this.packetLock.unlock();
+-        }
+     }
+ 
+     private int getMaximumFlyingTicks(Entity vehicle) {
+diff --git a/src/main/java/org/spigotmc/ActivationRange.java b/src/main/java/org/spigotmc/ActivationRange.java
+index 0a4e9e672cc695c3209fd40c93bad70ea8787d8d..cef2dbdd5caee2f06d4fabd7abbfb35aa2621887 100644
+--- a/src/main/java/org/spigotmc/ActivationRange.java
++++ b/src/main/java/org/spigotmc/ActivationRange.java
+@@ -184,6 +184,8 @@ public class ActivationRange
+      */
+     public static void activateEntities(Level world)
+     {
++        // Leaf - skip the whole pass when nobody is online: nothing to activate around
++        if (world.players().isEmpty()) return;
+         final int miscActivationRange = world.spigotConfig.miscActivationRange;
+         final int raiderActivationRange = world.spigotConfig.raiderActivationRange;
+         final int animalActivationRange = world.spigotConfig.animalActivationRange;
+@@ -208,6 +210,8 @@ public class ActivationRange
+         maxRange = Math.max( maxRange, villagerActivationRange );
+         // Paper end
+         maxRange = Math.min( ( world.spigotConfig.simulationDistance << 4 ) - 8, maxRange );
++        // Leaf - hoist world height out of player loop (constant per call)
++        final int worldHeight = world.getHeight();
+ 
+         for ( Player player : world.players() )
+         {
+@@ -219,15 +223,16 @@ public class ActivationRange
+ 
+             if (!player.level().purpurConfig.idleTimeoutTickNearbyEntities && player.isAfk()) continue; // Purpur
+             // Paper start
+-            int worldHeight = world.getHeight();
+-            ActivationRange.maxBB = player.getBoundingBox().inflate( maxRange, worldHeight, maxRange );
+-            ActivationType.MISC.boundingBox = player.getBoundingBox().inflate( miscActivationRange, worldHeight, miscActivationRange );
+-            ActivationType.RAIDER.boundingBox = player.getBoundingBox().inflate( raiderActivationRange, worldHeight, raiderActivationRange );
+-            ActivationType.ANIMAL.boundingBox = player.getBoundingBox().inflate( animalActivationRange, worldHeight, animalActivationRange );
+-            ActivationType.MONSTER.boundingBox = player.getBoundingBox().inflate( monsterActivationRange, worldHeight, monsterActivationRange );
+-            ActivationType.WATER.boundingBox = player.getBoundingBox().inflate( waterActivationRange, worldHeight, waterActivationRange );
+-            ActivationType.FLYING_MONSTER.boundingBox = player.getBoundingBox().inflate( flyingActivationRange, worldHeight, flyingActivationRange );
+-            ActivationType.VILLAGER.boundingBox = player.getBoundingBox().inflate( villagerActivationRange, worldHeight, villagerActivationRange );
++            // Leaf - read the player's bounding box once instead of 7 times
++            final AABB playerBB = player.getBoundingBox();
++            ActivationRange.maxBB = playerBB.inflate( maxRange, worldHeight, maxRange );
++            ActivationType.MISC.boundingBox = playerBB.inflate( miscActivationRange, worldHeight, miscActivationRange );
++            ActivationType.RAIDER.boundingBox = playerBB.inflate( raiderActivationRange, worldHeight, raiderActivationRange );
++            ActivationType.ANIMAL.boundingBox = playerBB.inflate( animalActivationRange, worldHeight, animalActivationRange );
++            ActivationType.MONSTER.boundingBox = playerBB.inflate( monsterActivationRange, worldHeight, monsterActivationRange );
++            ActivationType.WATER.boundingBox = playerBB.inflate( waterActivationRange, worldHeight, waterActivationRange );
++            ActivationType.FLYING_MONSTER.boundingBox = playerBB.inflate( flyingActivationRange, worldHeight, flyingActivationRange );
++            ActivationType.VILLAGER.boundingBox = playerBB.inflate( villagerActivationRange, worldHeight, villagerActivationRange );
+             // Paper end
+ 
+             // Paper start
