@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cirsius <swagydorwhatever@gmail.com>
+Date: Fri, 15 May 2026 13:10:20 -0500
+Subject: [PATCH] Avoid entityMap race + restore blockEvents dedup
+
+
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index 888456e88a45d9536342c065a4f6c7ed0cac38fb..d29ccfa9af9d32cf1c0eb1b7e97d7413343cc854 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -1240,23 +1240,23 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+     }
+ 
+     public void broadcast(Entity entity, Packet<?> packet) {
+-        synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+-        ChunkMap.TrackedEntity playerchunkmap_entitytracker = (ChunkMap.TrackedEntity) this.entityMap.get(entity.getId());
++        // Leaf - use entity.tracker (Paper fast-access) instead of entityMap.get().
++        // Skips the lock entirely (was held for the whole packet broadcast) and
++        // also avoids racing against concurrent addEntity/removeEntity readers.
++        final ChunkMap.TrackedEntity playerchunkmap_entitytracker = entity.tracker;
+ 
+         if (playerchunkmap_entitytracker != null) {
+             playerchunkmap_entitytracker.broadcast(packet);
+         }
+-        } // Leaf - end synchronize
+     }
+ 
+     protected void broadcastAndSend(Entity entity, Packet<?> packet) {
+-        synchronized (this.entityMap) { // Leaf - petal - synchronize entityMap
+-        ChunkMap.TrackedEntity playerchunkmap_entitytracker = (ChunkMap.TrackedEntity) this.entityMap.get(entity.getId());
++        // Leaf - same optimization as broadcast() above
++        final ChunkMap.TrackedEntity playerchunkmap_entitytracker = entity.tracker;
+ 
+         if (playerchunkmap_entitytracker != null) {
+             playerchunkmap_entitytracker.broadcastAndSend(packet);
+         }
+-        } // Leaf - end synchronize
+     }
+ 
+     public void resendBiomesForChunks(List<ChunkAccess> chunks) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 90c63027edb817a236ffc0688a7e0c2c7d6eec32..de47d5eb65d33b517679c7940600fe588d005306 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -222,7 +222,12 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     final Set<Mob> navigatingMobs = ConcurrentCollections.newHashSet();
+     volatile boolean isUpdatingNavigations;
+     protected final Raids raids;
+-    private final ConcurrentLinkedQueue<BlockEventData> blockEvents = new ConcurrentLinkedQueue<>();
++    // Leaf - revert from ConcurrentLinkedQueue to a synchronized LinkedHashSet equivalent.
++    // The CLQ was thread-safe but lost the dedup semantics of vanilla's ObjectLinkedOpenHashSet,
++    // letting the same piston event fire twice in one tick. ObjectLinkedOpenHashSet is mutated
++    // only inside blockEvent/runBlockEvents; both call sites are now guarded via the
++    // synchronized helpers below.
++    private final it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet<>();
+     private final List<BlockEventData> blockEventsToReschedule;
+     private boolean handlingTick;
+     private final List<CustomSpawner> customSpawners;
+@@ -1973,15 +1978,22 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+     @Override
+     public void blockEvent(BlockPos pos, Block block, int type, int data) {
+-        this.blockEvents.add(new BlockEventData(pos, block, type, data));
++        synchronized (this.blockEvents) { this.blockEvents.add(new BlockEventData(pos, block, type, data)); } // Leaf - synchronize
+     }
+ 
+     private void runBlockEvents() {
+         this.blockEventsToReschedule.clear();
+ 
+-        while (!this.blockEvents.isEmpty()) {
+-            BlockEventData blockactiondata = (BlockEventData) this.blockEvents.poll();
++        // Leaf - snapshot+drain pattern: hold the lock briefly to swap out the current
++        // batch, then process it without the lock held. New events scheduled during
++        // processing land in the (now empty) set and fire next tick, matching vanilla.
++        final java.util.List<BlockEventData> drained;
++        synchronized (this.blockEvents) {
++            drained = new java.util.ArrayList<>(this.blockEvents);
++            this.blockEvents.clear();
++        }
+ 
++        for (BlockEventData blockactiondata : drained) {
+             if (this.shouldTickBlocksAt(blockactiondata.pos())) {
+                 if (this.doBlockEvent(blockactiondata)) {
+                     this.server.getPlayerList().broadcast((Player) null, (double) blockactiondata.pos().getX(), (double) blockactiondata.pos().getY(), (double) blockactiondata.pos().getZ(), 64.0D, this.dimension(), new ClientboundBlockEventPacket(blockactiondata.pos(), blockactiondata.block(), blockactiondata.paramA(), blockactiondata.paramB()));
+@@ -1991,7 +2003,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+         }
+ 
+-        this.blockEvents.addAll(this.blockEventsToReschedule);
++        synchronized (this.blockEvents) { this.blockEvents.addAll(this.blockEventsToReschedule); } // Leaf - synchronize
+     }
+ 
+     private boolean doBlockEvent(BlockEventData event) {
+diff --git a/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java b/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
+index 13ae86d295f22ce0c373ae1246fc7cad8ff7662d..8b041bde83f82609c2b59917691b680966d0ad5b 100644
+--- a/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
++++ b/src/main/java/org/dreeam/leaf/async/tracker/MultithreadedTracker.java
+@@ -137,11 +137,17 @@ public class MultithreadedTracker {
+         }
+ 
+         final Entity[] rawEntities = entitySlices.entities.getRawData();
+-        final ChunkMap chunkMap = chunk.level.chunkSource.chunkMap;
++        // Leaf - use the Paper-fast-access `entity.tracker` field instead of looking up
++        // chunk.level.chunkSource.chunkMap.entityMap (an Int2ObjectLinkedOpenHashMap which
++        // is not thread-safe). The synchronized block guarding this iteration was removed
++        // in patch 0106 for perf; reading the unsynchronized map raced with main-thread
++        // addEntity/removeEntity and could see a torn linked-list/array state. The direct
++        // entity.tracker field is a single object reference - atomic reads in Java - so
++        // worst case we see a stale null and skip (handled below), no corruption.
+ 
+         for (Entity entity : rawEntities) {
+             if (entity != null) {
+-                ChunkMap.TrackedEntity entityTracker = chunkMap.entityMap.get(entity.getId());
++                final ChunkMap.TrackedEntity entityTracker = entity.tracker;
+                 if (entityTracker != null) {
+                     if (trackerStage == TrackerStage.SEND_CHANGES) {
+                         entityTracker.serverEntity.sendChanges();
