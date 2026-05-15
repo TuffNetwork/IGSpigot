@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cirsius <swagydorwhatever@gmail.com>
+Date: Fri, 15 May 2026 14:55:36 -0500
+Subject: [PATCH] Revert parallel plugin scan - Paper YAML pipeline not
+ thread-safe
+
+
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java b/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
+index 8a1227b641e258a9209341e8e987df1892dba8d7..b84f1822bd358f5d0fa6c75341b8e42fba020190 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
+@@ -27,35 +27,20 @@ public class DirectoryProviderSource implements ProviderSource<Path, List<Path>>
+             Files.createDirectories(context);
+         }
+ 
+-        // Leaf start - parallel plugin file preparation.
+-        // Each prepareContext opens the JAR to read its plugin name and walks the update
+-        // directory; on a server with ~70 plugins this is the dominant pre-bootstrap cost.
+-        // We preserve the file ordering by writing into a fixed-size results array then
+-        // filtering nulls, so the downstream load order is identical to the sequential path.
+-        final List<Path> jarPaths;
+-        try (java.util.stream.Stream<Path> stream = Files.walk(context, 1, FileVisitOption.FOLLOW_LINKS)) {
+-            jarPaths = stream.filter(this::isValidFile).sorted().toList();
+-        }
+-        final Path[] results = new Path[jarPaths.size()];
+-        final java.util.concurrent.ConcurrentLinkedQueue<Throwable> errors = new java.util.concurrent.ConcurrentLinkedQueue<>();
+-        java.util.stream.IntStream.range(0, jarPaths.size()).parallel().forEach(i -> {
+-            final Path path = jarPaths.get(i);
++        // Leaf - reverted parallel scan. Paper's configurate/SnakeYAML pipeline used by
++        // PluginFileType.getConfig(jar) on the update-check path is not thread-safe; with
++        // ~70 plugins it can deadlock during boot. Sequential is slow but reliable; the
++        // few seconds saved aren't worth a server that won't start.
++        final List<Path> files = new ArrayList<>();
++        this.walkFiles(context, path -> {
+             try {
+-                results[i] = FILE_PROVIDER_SOURCE.prepareContext(path);
++                files.add(FILE_PROVIDER_SOURCE.prepareContext(path));
+             } catch (IllegalArgumentException ignored) {
+                 // Ignore illegal argument exceptions from jar checking
+             } catch (final Exception e) {
+-                errors.add(e);
++                LOGGER.error("Error preparing plugin context: " + e.getMessage(), e);
+             }
+         });
+-        for (Throwable t : errors) {
+-            LOGGER.error("Error preparing plugin context: " + t.getMessage(), t);
+-        }
+-        final List<Path> files = new ArrayList<>(results.length);
+-        for (Path p : results) {
+-            if (p != null) files.add(p);
+-        }
+-        // Leaf end - parallel plugin file preparation
+         // Paper start - Remap plugins
+         if (io.papermc.paper.plugin.PluginInitializerManager.instance().pluginRemapper != null) {
+             return io.papermc.paper.plugin.PluginInitializerManager.instance().pluginRemapper.rewritePluginDirectory(files);
