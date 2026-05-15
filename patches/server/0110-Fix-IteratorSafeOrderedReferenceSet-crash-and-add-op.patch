@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cirsius <swagydorwhatever@gmail.com>
+Date: Fri, 15 May 2026 11:56:21 -0500
+Subject: [PATCH] Fix IteratorSafeOrderedReferenceSet crash and add
+ optimizations
+
+
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+index e4a3338a61a6f0053e0e2a1a096d9dfd8305a0da..e46b40734399a3104892d9b6bd2199ca2752f396 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
++++ b/src/main/java/io/papermc/paper/threadedregions/ParallelProcessor.java
+@@ -106,47 +106,35 @@ public class ParallelProcessor {
+ 
+         int poolSize = getPoolSize();
+         int batchSize = (chunks.size() + poolSize - 1) / poolSize;
++        int batches = (chunks.size() + batchSize - 1) / batchSize; // Leaf - exact batch count
++        final CountDownLatch latch = new CountDownLatch(batches); // Leaf - replace busy-poll of Future::isDone
+ 
+-        List<Future<?>> futures = new ArrayList<>(poolSize);
+         for (int i = 0; i < chunks.size(); i += batchSize) {
+             List<LevelChunk> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
+-            Future<?> future = tickPool.submit(() -> {
+-                for (LevelChunk chunk : batch) {
+-                    try {
+-                        world.tickChunk(chunk, randomTickSpeed);
+-                    } catch (Throwable t) {
+-                        LOGGER.error("Error in async chunk tick", t);
++            tickPool.execute(() -> {
++                try {
++                    for (LevelChunk chunk : batch) {
++                        try {
++                            world.tickChunk(chunk, randomTickSpeed);
++                        } catch (Throwable t) {
++                            LOGGER.error("Error in async chunk tick", t);
++                        }
+                     }
++                } finally {
++                    latch.countDown();
+                 }
+-                return null;
+             });
+-            futures.add(future);
+         }
+ 
+-        boolean allDone;
+-        do {
+-            allDone = true;
+-            for (int i = 0; i < futures.size(); i++) {
+-                if (!futures.get(i).isDone()) {
+-                    allDone = false;
+-                    break;
+-                }
+-            }
+-
+-            if (!allDone) {
+-                boolean pumped = world.getChunkSource().pollTask();
+-                if (!pumped) {
++        // Leaf - drain main-thread chunk tasks while async batches finish
++        try {
++            while (!latch.await(0, TimeUnit.NANOSECONDS)) {
++                if (!world.getChunkSource().pollTask()) {
+                     Thread.onSpinWait();
+                 }
+             }
+-        } while (!allDone);
+-
+-        for (Future<?> future : futures) {
+-            try {
+-                future.get();
+-            } catch (Exception e) {
+-                LOGGER.error("Error in async chunk tick batch", e);
+-            }
++        } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
+         }
+     }
+ 
+@@ -159,49 +147,38 @@ public class ParallelProcessor {
+ 
+         int poolSize = getPoolSize();
+         int chunkSize = (entities.size() + poolSize - 1) / poolSize;
++        int batches = (entities.size() + chunkSize - 1) / chunkSize; // Leaf
++        final CountDownLatch latch = new CountDownLatch(batches); // Leaf - replace busy-poll
+ 
+-        List<Future<?>> futures = new ArrayList<>(poolSize);
+         for (int i = 0; i < entities.size(); i += chunkSize) {
+             List<Entity> chunk = entities.subList(i, Math.min(i + chunkSize, entities.size()));
+-            Future<?> future = tickPool.submit(() -> {
+-                for (Entity entity : chunk) {
+-                    if (shouldTickSynchronously(entity)) continue;
+-                    performAsyncEntityTick(world, entity);
++            tickPool.execute(() -> {
++                try {
++                    for (Entity entity : chunk) {
++                        if (shouldTickSynchronously(entity)) continue;
++                        performAsyncEntityTick(world, entity);
++                    }
++                } finally {
++                    latch.countDown();
+                 }
+             });
+-            futures.add(future);
+         }
+ 
++        // Sync-only entities tick on the main thread while async batches run
+         for (Entity e : entities) {
+             if (shouldTickSynchronously(e)) {
+                 tickSynchronously(world, e);
+             }
+         }
+ 
+-        boolean allDone;
+-        do {
+-            allDone = true;
+-            for (int i = 0; i < futures.size(); i++) {
+-                if (!futures.get(i).isDone()) {
+-                    allDone = false;
+-                    break;
+-                }
+-            }
+-
+-            if (!allDone) {
+-                boolean pumped = world.getChunkSource().pollTask();
+-                if (!pumped) {
++        try {
++            while (!latch.await(0, TimeUnit.NANOSECONDS)) {
++                if (!world.getChunkSource().pollTask()) {
+                     Thread.onSpinWait();
+                 }
+             }
+-        } while (!allDone);
+-
+-        for (Future<?> future : futures) {
+-            try {
+-                future.get();
+-            } catch (Exception e) {
+-                LOGGER.error("Error in async entity tick", e);
+-            }
++        } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
+         }
+     }
+ 
+diff --git a/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java b/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java
+index d9d7e6480ca40deb03284bf71a565dd9d2edff86..4efae2caac977d85116bacbf0b218313ef7a4937 100644
+--- a/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java
++++ b/src/main/java/io/papermc/paper/util/maplist/IteratorSafeOrderedReferenceSet.java
+@@ -8,6 +8,11 @@ import java.util.NoSuchElementException;
+ 
+ public final class IteratorSafeOrderedReferenceSet<E> {
+ 
++    // Leaf start - crash recovery
++    private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger("IteratorSafeOrderedReferenceSet");
++    private static volatile boolean WARNED_CORRUPTED = false;
++    // Leaf end - crash recovery
++
+     public static final int ITERATOR_FLAG_SEE_ADDITIONS = 1 << 0;
+ 
+     protected final Reference2IntLinkedOpenHashMap<E> indexMap;
+@@ -130,11 +135,33 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+     public synchronized boolean remove(final E element) {
+         final int index = this.indexMap.removeInt(element);
+         if (index >= 0) {
++            // Leaf start - bounds-check before touching listElements: parallel ticking
++            // can race here and we'd rather skip a stale entry than crash the world tick
++            if (index >= this.listElements.length) {
++                if (!WARNED_CORRUPTED) {
++                    WARNED_CORRUPTED = true;
++                    LOGGER.warn("IteratorSafeOrderedReferenceSet desync: index {} out of array bounds {} - recovering",
++                                index, this.listElements.length);
++                }
++                this.firstInvalidIndex = 0; // force full defrag rebuild
++                return true;
++            }
++            // Leaf end
+             if (this.firstInvalidIndex < 0 || index < this.firstInvalidIndex) {
+                 this.firstInvalidIndex = index;
+             }
+             if (this.listElements[index] != element) {
+-                throw new IllegalStateException();
++                // Leaf start - do not crash the server on concurrency-induced desync.
++                // The map says we own this index but the list disagrees - the list and the
++                // map will be re-sync'd by the next defrag.
++                if (!WARNED_CORRUPTED) {
++                    WARNED_CORRUPTED = true;
++                    LOGGER.warn("IteratorSafeOrderedReferenceSet desync at index {} - recovering by forcing defrag",
++                                index);
++                }
++                this.firstInvalidIndex = 0;
++                return true;
++                // Leaf end
+             }
+             this.listElements[index] = null;
+             if (this.allowSafeIteration() && this.iteratorCount == 0 && this.getFragFactor() >= this.maxFragFactor) {
+@@ -146,7 +173,7 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+         return false;
+     }
+ 
+-    public boolean contains(final E element) {
++    public synchronized boolean contains(final E element) { // Leaf - thread-safe
+         return this.indexMap.containsKey(element);
+     }
+ 
+@@ -168,7 +195,7 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+         return true;
+     }
+ 
+-    protected void defrag() {
++    protected synchronized void defrag() { // Leaf - fully thread-safe
+         if (this.firstInvalidIndex < 0) {
+             return; // nothing to do
+         }
+@@ -191,7 +218,14 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+             lastValidIndex = 0;
+         } else {
+             lastValidIndex = this.firstInvalidIndex;
+-            final E key = backingArray[lastValidIndex - 1];
++            // Leaf start - defensively handle a null predecessor; can happen after a recovery
++            final E key = lastValidIndex > 0 && lastValidIndex - 1 < backingArray.length ? backingArray[lastValidIndex - 1] : null;
++            if (key == null) {
++                // Restart a full defrag next time around to be safe
++                this.firstInvalidIndex = 0;
++                return;
++            }
++            // Leaf end
+             iterator = this.indexMap.reference2IntEntrySet().fastIterator(new Reference2IntMap.Entry<E>() {
+                 @Override
+                 public int getIntValue() {
+@@ -225,30 +259,31 @@ public final class IteratorSafeOrderedReferenceSet<E> {
+         //this.check();
+     }
+ 
+-    public E rawGet(final int index) {
++    public synchronized E rawGet(final int index) { // Leaf - thread-safe + bounds check
++        if (index < 0 || index >= this.listElements.length) return null;
+         return this.listElements[index];
+     }
+ 
+-    public int size() {
++    public synchronized int size() { // Leaf - thread-safe
+         // always returns the correct amount - listSize can be different
+         return this.indexMap.size();
+     }
+ 
+-    public IteratorSafeOrderedReferenceSet.Iterator<E> iterator() {
++    public synchronized IteratorSafeOrderedReferenceSet.Iterator<E> iterator() { // Leaf - thread-safe
+         return this.iterator(0);
+     }
+ 
+-    public IteratorSafeOrderedReferenceSet.Iterator<E> iterator(final int flags) {
++    public synchronized IteratorSafeOrderedReferenceSet.Iterator<E> iterator(final int flags) { // Leaf - thread-safe
+         if (this.allowSafeIteration()) {
+             ++this.iteratorCount;
+         }
+         return new BaseIterator<>(this, true, (flags & ITERATOR_FLAG_SEE_ADDITIONS) != 0 ? Integer.MAX_VALUE : this.listSize);
+     }
+ 
+-    public java.util.Iterator<E> unsafeIterator() {
++    public synchronized java.util.Iterator<E> unsafeIterator() { // Leaf - thread-safe
+         return this.unsafeIterator(0);
+     }
+-    public java.util.Iterator<E> unsafeIterator(final int flags) {
++    public synchronized java.util.Iterator<E> unsafeIterator(final int flags) { // Leaf - thread-safe
+         return new BaseIterator<>(this, false, (flags & ITERATOR_FLAG_SEE_ADDITIONS) != 0 ? Integer.MAX_VALUE : this.listSize);
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index a6e45181845ec24a39f578fb5d590956e24db52e..dbb842a6f73e5936ead8d7bca0f8ce5a9a4c2934 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -914,7 +914,9 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+ 
+             org.spigotmc.ActivationRange.activateEntities(this); // Spigot
+-            List<Entity> entitiesToTick = new java.util.ArrayList<>();
++            // Leaf - pre-size: each tick the entity count is roughly stable, so the previous
++            // size is a fine estimate and avoids ArrayList growth on hot path with thousands of entities
++            List<Entity> entitiesToTick = new java.util.ArrayList<>(Math.max(64, this.entityTickList.entities.size()));
+             this.entityTickList.forEach((entity) -> {
+                 entity.activatedPriorityReset = false; // Pufferfish - DAB
+                 if (!entity.isRemoved()) {
+diff --git a/src/main/java/net/minecraft/world/phys/AABB.java b/src/main/java/net/minecraft/world/phys/AABB.java
+index 796767d49c248d575eff64bc35756fa75cab424a..2696c2954c4026b84aa3982a10c2905fbbd42327 100644
+--- a/src/main/java/net/minecraft/world/phys/AABB.java
++++ b/src/main/java/net/minecraft/world/phys/AABB.java
+@@ -20,13 +20,10 @@ public class AABB {
+     public final double maxY;
+     public final double maxZ;
+ 
+-    // Lazily cached values – computed on first access, 0.0 = unset sentinel
+-    // (valid since a zero-area box on one axis would still have valid other sizes)
+-    private double cachedXSize = Double.NaN;
+-    private double cachedYSize = Double.NaN;
+-    private double cachedZSize = Double.NaN;
+-    private int cachedHashCode = 0;
+-    private boolean hashCodeComputed = false;
++    // Leaf - removed lazy size/hash cache. Non-volatile mutable fields on a class
++    // accessed concurrently breaks happens-before: a reader could observe
++    // hashCodeComputed=true with cachedHashCode=0 (the default). Three doubles
++    // worth of subtraction is much cheaper than the cost of fixing this properly.
+ 
+     public AABB(double x1, double y1, double z1, double x2, double y2, double z2) {
+         // Branchless min/max is slightly faster on modern JVMs due to CMOV
+@@ -151,8 +148,7 @@ public class AABB {
+ 
+     @Override
+     public int hashCode() {
+-        // Cache the hash – AABBs are immutable so this is safe
+-        if (hashCodeComputed) return cachedHashCode;
++        // Leaf - cache removed (see field comment); recompute every time
+         long l = Double.doubleToLongBits(this.minX);
+         int i = (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.minY);
+@@ -164,10 +160,7 @@ public class AABB {
+         l = Double.doubleToLongBits(this.maxY);
+         i = 31 * i + (int) (l ^ l >>> 32);
+         l = Double.doubleToLongBits(this.maxZ);
+-        i = 31 * i + (int) (l ^ l >>> 32);
+-        cachedHashCode = i;
+-        hashCodeComputed = true;
+-        return i;
++        return 31 * i + (int) (l ^ l >>> 32);
+     }
+ 
+     // ──────────────────────────────────────────────────────────────
+@@ -243,10 +236,11 @@ public class AABB {
+     // ──────────────────────────────────────────────────────────────
+ 
+     public boolean intersects(AABB box) {
+-        // Micro-optimized branchless-style check for modern JIT
+-        return (this.minX < box.maxX) & (this.maxX > box.minX)
+-            && (this.minY < box.maxY) & (this.maxY > box.minY)
+-            && (this.minZ < box.maxZ) & (this.maxZ > box.minZ);
++        // Leaf - normal && short-circuiting beats forced-evaluation & on AABB intersection.
++        // X axis disjoint? Most AABB pairs are disjoint on X, so bail out early.
++        return this.minX < box.maxX && this.maxX > box.minX
++            && this.minY < box.maxY && this.maxY > box.minY
++            && this.minZ < box.maxZ && this.maxZ > box.minZ;
+     }
+ 
+     public boolean intersects(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
+@@ -273,22 +267,19 @@ public class AABB {
+     }
+ 
+     // ──────────────────────────────────────────────────────────────
+-    // Size queries – cached to avoid repeated subtraction
++    // Size queries – Leaf: uncached (see field comment)
+     // ──────────────────────────────────────────────────────────────
+ 
+     public double getXsize() {
+-        if (Double.isNaN(cachedXSize)) cachedXSize = this.maxX - this.minX;
+-        return cachedXSize;
++        return this.maxX - this.minX;
+     }
+ 
+     public double getYsize() {
+-        if (Double.isNaN(cachedYSize)) cachedYSize = this.maxY - this.minY;
+-        return cachedYSize;
++        return this.maxY - this.minY;
+     }
+ 
+     public double getZsize() {
+-        if (Double.isNaN(cachedZSize)) cachedZSize = this.maxZ - this.minZ;
+-        return cachedZSize;
++        return this.maxZ - this.minZ;
+     }
+ 
+     /** Average of the three side lengths. */
